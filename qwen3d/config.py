@@ -474,6 +474,9 @@ def add_maskformer2_video_config(cfg):
     # json describe entries carry "volume_m3" (object bounding-box volume, the ANSWER_ORDER size
     # sort key), so the target shows the size the order follows. Needs object sizes in index.json.
     cfg.VLMCD.ANSWER_VOLUME = True
+    # With ANSWER_ORDER size, the json describe prompt states the order. False drops that sentence,
+    # reproducing the prompt of models trained on JSON answers before volumes were added.
+    cfg.VLMCD.ORDER_IN_PROMPT = True
     cfg.VLMCD.RETRIES = 5                # Hub read attempts per example
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming

@@ -261,7 +261,8 @@ def _json(obj):
 STATE_ENCODINGS = ("time", "offset")
 
 
-def question(task, state_encoding="time", answer_format="json", order="size", volume=True):
+def question(task, state_encoding="time", answer_format="json", order="size", volume=True,
+             order_in_prompt=True):
     """The prompt for a task.
 
     How the two scans reach the model depends on ``VLMCD.STATE_ENCODING`` (see
@@ -285,6 +286,9 @@ def question(task, state_encoding="time", answer_format="json", order="size", vo
         ``VLMCD.ANSWER_ORDER``; with ``size`` a ``json`` ``describe`` prompt states the order.
     volume : bool
         ``VLMCD.ANSWER_VOLUME``; a ``json`` ``describe`` prompt then asks for ``volume_m3``.
+    order_in_prompt : bool
+        ``VLMCD.ORDER_IN_PROMPT``; False leaves the order sentence out, which reproduces the
+        prompt of models trained before it was added (JSON answers without volumes).
 
     Returns
     -------
@@ -307,7 +311,7 @@ def question(task, state_encoding="time", answer_format="json", order="size", vo
         fields += '"distance_m": for a moved object, how far it moved in metres}.'
         text = ("List every object that was moved, added or removed as a JSON array "
                 "with one entry per object: " + fields)
-        if order == "size":
+        if order == "size" and order_in_prompt:
             text += (" List the moved objects first, then the added, then the removed; "
                      "within each, the largest object first.")
         return intro + text
@@ -422,6 +426,48 @@ def _json_objects(text):
     return out
 
 
+def _number(obj, key):
+    """``obj[key]`` as a finite float, or None when missing or not a number."""
+    try:
+        v = float(obj[key]) if obj.get(key) is not None else None
+    except (TypeError, ValueError):
+        return None
+    return v if v is None or math.isfinite(v) else None
+
+
+def parse_describe_entries(text):
+    """Parse a ``describe`` answer, ``json`` or ``text``, into its entries in answer order.
+
+    Parameters
+    ----------
+    text : str
+        Model output or ground truth.
+
+    Returns
+    -------
+    list of dict
+        ``action`` (``move`` / ``add`` / ``remove``), ``category``, and ``distance_m`` and
+        ``volume_m3`` as floats, or None when not given or not a number (``text`` answers
+        never give a volume). Entries with an unknown action are skipped.
+    """
+    out = []
+    if text.lstrip().startswith(("[", "{")):
+        for obj in _json_objects(text):
+            action = PRESENT.get(str(obj.get("action", "")).strip().lower())
+            if action is None:
+                continue
+            out.append({"action": action, "category": clean_category(str(obj.get("class") or "")),
+                        "distance_m": _number(obj, "distance_m"), "volume_m3": _number(obj, "volume_m3")})
+        return out
+    for clause in text.lower().split(";"):
+        m = re.match(r"\s*(moved|added|removed)\s+(?:the|a|an)?\s*([a-z][a-z0-9]*)", clause)
+        if m:
+            d = re.search(r"\bby\s+(\d+(?:\.\d*)?)\s*m\b", clause)
+            out.append({"action": PRESENT[m.group(1)], "category": m.group(2),
+                        "distance_m": float(d.group(1)) if d else None, "volume_m3": None})
+    return out
+
+
 def parse_describe_records(text):
     """Parse a ``describe`` answer, ``json`` or ``text``, into change records.
 
@@ -433,28 +479,9 @@ def parse_describe_records(text):
     Returns
     -------
     list of tuple
-        ``(action, category, distance_m)``; ``action`` is ``move`` / ``add`` / ``remove``
-        and ``distance_m`` a float, or None when not given or not a number.
+        ``(action, category, distance_m)`` per entry of ``parse_describe_entries``.
     """
-    out = []
-    if text.lstrip().startswith(("[", "{")):
-        for obj in _json_objects(text):
-            action = PRESENT.get(str(obj.get("action", "")).strip().lower())
-            if action is None:
-                continue
-            cat = clean_category(str(obj.get("class") or ""))
-            try:
-                dist = float(obj["distance_m"]) if obj.get("distance_m") is not None else None
-            except (TypeError, ValueError):
-                dist = None
-            out.append((action, cat, dist if dist is None or dist == dist else None))
-        return out
-    for clause in text.lower().split(";"):
-        m = re.match(r"\s*(moved|added|removed)\s+(?:the|a|an)?\s*([a-z][a-z0-9]*)", clause)
-        if m:
-            d = re.search(r"\bby\s+(\d+(?:\.\d*)?)\s*m\b", clause)
-            out.append((PRESENT[m.group(1)], m.group(2), float(d.group(1)) if d else None))
-    return out
+    return [(e["action"], e["category"], e["distance_m"]) for e in parse_describe_entries(text)]
 
 
 def parse_describe(text):

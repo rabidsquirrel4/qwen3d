@@ -38,128 +38,9 @@ from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
 
 tokenizer = PTBTokenizer()
 
-VLMCD_DIST_THRESHOLDS = (0.1, 0.25, 0.5)  # metres
-
-
-def match_move_distances(pred, gt):
-    """Pair predicted and ground-truth moved objects of one example to score their distances.
-
-    Within each class, predicted and true moves are paired one to one, minimising the
-    total absolute distance error (``scipy.optimize.linear_sum_assignment``). This is the
-    best case when an example moves several objects of the same class; with one object
-    per class, which is the usual case, it is simply the pair.
-
-    Parameters
-    ----------
-    pred, gt : list of tuple
-        ``parse_describe_records`` output.
-
-    Returns
-    -------
-    tuple
-        ``(errors, n_gt, n_missing)``: absolute errors in metres of the matched pairs,
-        ground-truth moves that have a distance, and of those, ones matched to a
-        prediction of the class that gave no distance.
-    """
-    from scipy.optimize import linear_sum_assignment
-    errors, n_gt, n_missing = [], 0, 0
-    classes = {c for a, c, d in gt if a == "move" and d is not None}
-    for cls in classes:
-        g = [d for a, c, d in gt if a == "move" and c == cls and d is not None]
-        p_all = [d for a, c, d in pred if a == "move" and c == cls]
-        p = [d for d in p_all if d is not None]
-        n_gt += len(g)
-        if p:
-            cost = np.abs(np.array(p)[:, None] - np.array(g)[None, :])
-            rows, cols = linear_sum_assignment(cost)
-            errors += [float(cost[r, c]) for r, c in zip(rows, cols)]
-        # Further true moves of the class, predicted as moved but without a distance.
-        n_missing += max(0, min(len(g), len(p_all)) - len(p))
-    return errors, n_gt, n_missing
-
-
-def vlmcd_metrics(dataset_name, res):
-    """Task metrics for ``vlmcd_<task>_<split>`` predictions.
-
-    Parameters
-    ----------
-    dataset_name : str
-    res : list of tuple
-        ``(prediction, [answer])`` pairs, lower-cased.
-
-    Returns
-    -------
-    dict
-        ``describe``: micro precision / recall / F1 over ``(action, category)`` changes,
-        and per-action F1. For moved objects whose true distance is given (seen in both
-        scans), paired by class (``match_move_distances``): ``move_dist_mae_m`` and
-        ``move_dist_medae_m`` (absolute error of the paired distances),
-        ``move_dist_acc_<t>m`` (share of pairs within t metres), ``move_dist_recall_0.25m``
-        (share of all such true moves found with the right class and a distance within
-        0.25 m), ``move_dist_pairs`` and ``move_dist_missing`` (paired moves without a
-        predicted distance). JSON answers add ``json_valid`` (share of predictions that
-        parse as a whole). ``count``: per-action and all-actions count accuracy, and the
-        mean absolute error of the total.
-    """
-    from qwen3d.data_video.datasets.vlm_cd import (ACTIONS, dataset_task, is_json_answer, parse_count,
-                                                   parse_describe_records)
-    out = {}
-    task = dataset_task(dataset_name)
-    if task == "describe":
-        tp = fp = fn = 0
-        per = {a: [0, 0, 0] for a in ACTIONS}
-        errors, n_gt_dist, n_missing, n_json, json_task = [], 0, 0, 0, False
-        for pred, answers in res:
-            pr, gr = parse_describe_records(pred), parse_describe_records(answers[0])
-            p = Counter((a, c) for a, c, _ in pr)
-            g = Counter((a, c) for a, c, _ in gr)
-            e, n, m = match_move_distances(pr, gr)
-            errors += e
-            n_gt_dist += n
-            n_missing += m
-            if is_json_answer(answers[0]):
-                json_task = True
-                n_json += is_json_answer(pred)
-            for key in set(p) | set(g):
-                t = min(p[key], g[key])
-                tp += t
-                fp += p[key] - t
-                fn += g[key] - t
-                per[key[0]][0] += t
-                per[key[0]][1] += p[key] - t
-                per[key[0]][2] += g[key] - t
-        prec = tp / (tp + fp) if tp + fp else 0.0
-        rec = tp / (tp + fn) if tp + fn else 0.0
-        out.update(change_precision=prec, change_recall=rec,
-                   change_f1=2 * prec * rec / (prec + rec) if prec + rec else 0.0)
-        for a, (t, f_p, f_n) in per.items():
-            out[f"{a}_f1"] = 2 * t / (2 * t + f_p + f_n) if t + f_p + f_n else 0.0
-        if n_gt_dist:
-            err = np.array(errors) if errors else np.array([np.nan])
-            out["move_dist_mae_m"] = float(np.mean(err))
-            out["move_dist_medae_m"] = float(np.median(err))
-            for t in VLMCD_DIST_THRESHOLDS:
-                out[f"move_dist_acc_{t}m"] = float(np.mean(err <= t)) if errors else 0.0
-            out["move_dist_recall_0.25m"] = sum(x <= 0.25 for x in errors) / n_gt_dist
-            out["move_dist_pairs"] = float(len(errors))
-            out["move_dist_missing"] = float(n_missing)
-        if json_task:
-            out["json_valid"] = n_json / max(len(res), 1)
-    elif task == "count":
-        correct = {a: 0 for a in ACTIONS}
-        all_correct, abs_err = 0, 0.0
-        for pred, answers in res:
-            p, g = parse_count(pred), parse_count(answers[0])
-            ok = [p[a] == g[a] for a in ACTIONS]
-            for a, o in zip(ACTIONS, ok):
-                correct[a] += o
-            all_correct += all(ok)
-            abs_err += abs(sum(p[a] or 0 for a in ACTIONS) - sum(g[a] or 0 for a in ACTIONS))
-        n = max(len(res), 1)
-        out.update({f"{a}_count_acc": correct[a] / n for a in ACTIONS})
-        out.update(count_all_acc=all_correct / n, total_count_mae=abs_err / n)
-    print(", ".join(f"{k}: {v:.4f}" for k, v in out.items()))
-    return out
+# Change-detection metrics live in their own module so vlm_cd/score_vlm_cd.py can load them
+# without importing the package.
+from qwen3d.data_video.vlmcd_metrics import vlmcd_metrics  # noqa: E402
 
 
 class VQAEvaluator(DatasetEvaluator):
@@ -207,7 +88,19 @@ class VQAEvaluator(DatasetEvaluator):
         out_dir = os.path.join(root, "inference")
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, f"{self.dataset_name}_predictions.json"), "w") as f:
-            json.dump({"metrics": eval_results, "predictions": self.vlmcd_records}, f, indent=1)
+            json.dump({"metrics": eval_results, "settings": self._vlmcd_settings(),
+                       "predictions": self.vlmcd_records}, f, indent=1)
+
+    def _vlmcd_settings(self):
+        """The answer settings the targets were built with (read back by score_vlm_cd.py)."""
+        vc = getattr(self.cfg, "VLMCD", None) if self.cfg is not None else None
+        if not vc:
+            return {}
+        out = {k: vc.get(k) for k in ("ANSWER_FORMAT", "ANSWER_ORDER", "ANSWER_VOLUME", "ORDER_IN_PROMPT",
+                                       "STATE_ENCODING", "ONLY_VISIBLE_CHANGES", "FRAMES_PER_STATE")}
+        gen = self.cfg.get("GEN_KWARGS")
+        out["MAX_NEW_TOKENS"] = gen.get("max_new_tokens") if gen else None  # json_compliance_vlm_cd.py
+        return out
 
     # called per batch
     def process(self, inputs, outputs):
@@ -303,7 +196,8 @@ class VQAEvaluator(DatasetEvaluator):
             eval_results.update(detection_result)
 
         if self.dataset_name.startswith('vlmcd_'):
-            eval_results.update(vlmcd_metrics(self.dataset_name, res))
+            order = self._vlmcd_settings().get("ANSWER_ORDER") or "size"
+            eval_results.update(vlmcd_metrics(self.dataset_name, res, order))
             self._save_vlmcd_predictions(eval_results)
 
         if is_dist_avail_and_initialized():
