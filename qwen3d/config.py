@@ -479,6 +479,14 @@ def add_maskformer2_video_config(cfg):
     # With AFTER_FRAMES: share of samples whose views come from frames showing some change
     # (the dataset's visibility lists); the rest come from all frames.
     cfg.VLMCD.VIEW_CHANGE_PROB = 0.9
+    # Where the before scan (the map) comes from: "frames" = FRAMES_PER_STATE RGB-D frames through
+    # the ViT, like the after scan; "points" = only the dataset's before point cloud, voxelized at
+    # MAP_VOXEL_SIZE, each voxel token built by VoxelPointEncoder from its points (no image
+    # features). "points" needs AFTER_FRAMES > 0 and VOXEL_POINT_ENCODER.ENABLED.
+    cfg.VLMCD.MAP_SOURCE = "frames"
+    cfg.VLMCD.MAP_VOXEL_SIZE = 0.2         # metres; a room is ~4.6k voxels at 0.2 m (79k at 0.05 m)
+    cfg.VLMCD.MAP_MAX_TOKENS = 6000        # random subset of map voxels beyond this
+    cfg.VLMCD.MAP_POINTS_PER_VOXEL = 64    # random subset of each map voxel's points
 
     # Point encoder fused in voxel space (qwen3d/modeling/voxel_point_encoder.py): a PointNet over
     # the raw points inside each 5 cm voxel token, added to the voxel's image feature through a
@@ -489,6 +497,7 @@ def add_maskformer2_video_config(cfg):
     cfg.VOXEL_POINT_ENCODER.ENABLED = False
     cfg.VOXEL_POINT_ENCODER.HIDDEN_DIM = 128
     cfg.VOXEL_POINT_ENCODER.POINTS_PER_VOXEL = 32  # random subset of each voxel's points (mapper)
+    cfg.VOXEL_POINT_ENCODER.LR_MULTIPLIER = 10.0   # the encoder trains from scratch (SOLVER.BASE_LR x this)
     cfg.VLMCD.RETRIES = 5                # Hub read attempts per example
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming

@@ -235,6 +235,7 @@ class Qwen3D(nn.Module):
                 hidden_dim=cfg.VOXEL_POINT_ENCODER.HIDDEN_DIM,
                 voxel_size=cfg.INPUT.VOXEL_SIZE[::-1][1],
                 max_points=cfg.VOXEL_POINT_ENCODER.POINTS_PER_VOXEL,
+                map_tokens=cfg.VLMCD.MAP_SOURCE == "points",
             )
 
         self.mask_decoder = mask_decoder
@@ -888,6 +889,48 @@ class Qwen3D(nn.Module):
         self._voxel_point_stats = stats
         return featurecloud + offsets.to(featurecloud.dtype).unsqueeze(0)
 
+    def prepend_map_tokens(self, sample, pointcloud, featurecloud, pixel_indices, voxel_state):
+        """Put the point-cloud map's voxel tokens in front, as scan 0 (VLMCD.MAP_SOURCE points).
+
+        The image voxels then all belong to the after views (scan 1); the map tokens are
+        built by ``VoxelPointEncoder.map_tokens`` from the map's points alone.
+
+        Parameters
+        ----------
+        sample : dict
+            With ``map_voxel_xyz``, ``map_voxel_count``, ``map_points_*`` and ``map_voxel_size``.
+        pointcloud : Tensor [1, N, 3]
+        featurecloud : Tensor [1, N, F]
+        pixel_indices : list of one Tensor [N, 2]
+        voxel_state : Tensor [1, N]
+
+        Returns
+        -------
+        tuple
+            ``pointcloud``, ``featurecloud``, ``pixel_indices`` and ``voxel_state`` with the
+            ``M`` map tokens first (pixel indices 0 for them).
+        """
+        assert voxel_state is not None, "VLMCD.MAP_SOURCE points needs VLMCD.STATE_ENCODING time"
+        assert bool((voxel_state > 0).all()), "with a point-cloud map, image voxels must all be after views"
+        dev = self.device
+        tok = self.voxel_point_encoder.map_tokens(
+            sample["map_points_xyz"].to(dev, non_blocking=True),
+            sample["map_points_rgb"].to(dev, non_blocking=True),
+            sample["map_points_voxel"].to(dev, non_blocking=True),
+            sample["map_voxel_count"].to(dev, non_blocking=True),
+            sample["map_voxel_size"],
+            featurecloud[0],
+        )
+        xyz = sample["map_voxel_xyz"].to(dev, dtype=pointcloud.dtype, non_blocking=True)
+        m = xyz.shape[0]
+        self._map_tokens = m
+        return (
+            torch.cat([xyz.unsqueeze(0), pointcloud], 1),
+            torch.cat([tok.to(featurecloud.dtype).unsqueeze(0), featurecloud], 1),
+            [torch.cat([pixel_indices[0].new_zeros((m, 2)), pixel_indices[0]], 0)],
+            torch.cat([voxel_state.new_zeros((1, m)), voxel_state], 1),
+        )
+
     def upsample_point_features(self, source_pc, source_features, target_pc, k_neighbors=3):
         """
         Upsample point cloud features from a sparse point cloud to a denser target point cloud.
@@ -1252,6 +1295,9 @@ class Qwen3D(nn.Module):
 
             if self.voxel_point_encoder is not None and decoder_3d:
                 featurecloud = self.add_voxel_point_features(batched_inputs, pointcloud, featurecloud, voxel_state)
+                if "map_voxel_xyz" in batched_inputs[0]:
+                    pointcloud, featurecloud, pixel_indices, voxel_state = self.prepend_map_tokens(
+                        batched_inputs[0], pointcloud, featurecloud, pixel_indices, voxel_state)
             if self.training and self.cfg.GENERATION:
                 if actual_decoder_3d:
                     answers = [
