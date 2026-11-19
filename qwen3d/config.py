@@ -24,6 +24,8 @@ def add_maskformer2_config(cfg):
     cfg.SOLVER.WEIGHT_DECAY_EMBED = 0.0
     # optimizer
     cfg.SOLVER.OPTIMIZER = "ADAMW"
+    cfg.SOLVER.MAX_TO_KEEP = 15          # periodic model_XXXXXXX.pth files kept, 0 = all (model_final.pth is never deleted)
+    cfg.SOLVER.SAVE_LAST_ITERS = 0       # also save a checkpoint after each of the last N iterations (the last one is model_final.pth)
     cfg.SOLVER.BACKBONE_MULTIPLIER = 0.1
 
     # mask_former model config
@@ -464,3 +466,5 @@ def add_maskformer2_video_config(cfg):
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming
     cfg.VLMCD.EVAL_SUBSET = 0            # evaluate on a fixed random subset of this many examples (0: all)
+    cfg.VLMCD.EVAL_LOSS = True           # at eval, also run a teacher-forced pass per example: loss and
+                                         # answer-token accuracy (the training metrics) next to generation

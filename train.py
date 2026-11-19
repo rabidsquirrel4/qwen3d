@@ -46,7 +46,7 @@ import torch.multiprocessing as mp
 from viztracer import VizTracer
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.utils.events import EventStorage, get_event_storage
+from detectron2.utils.events import CommonMetricPrinter, EventStorage, get_event_storage
 from detectron2.engine import (
     AMPTrainer,
     DefaultTrainer,
@@ -56,6 +56,26 @@ from detectron2.engine import (
     launch,
 )
 from detectron2.engine.defaults import hooks
+
+
+class LastItersCheckpointer(hooks.HookBase):
+    """Save model_XXXXXXX.pth after each of the last `n` iterations of the run.
+
+    The very last iteration is skipped because PeriodicCheckpointer already writes it as
+    model_final.pth, and iterations that PeriodicCheckpointer saves on its period are
+    skipped too. These files are never deleted by SOLVER.MAX_TO_KEEP.
+    """
+
+    def __init__(self, checkpointer, n, period):
+        self.checkpointer = checkpointer
+        self.n = n
+        self.period = period
+
+    def after_step(self):
+        it, max_iter = self.trainer.iter, self.trainer.max_iter
+        if it < max_iter - self.n or it >= max_iter - 1 or (it + 1) % self.period == 0:
+            return
+        self.checkpointer.save("model_{:07d}".format(it), iteration=it)
 from detectron2.evaluation import COCOEvaluator, DatasetEvaluator, inference_on_dataset
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
@@ -82,6 +102,7 @@ from qwen3d import (
 )
 from qwen3d.data_video.data_utils import resolve_feature_dir_for_backbone
 from qwen3d.data_video.dataset_mapper_vlm_cd import VlmCdDatasetMapper
+from qwen3d.data_video.datasets.vlm_cd import dataset_task
 from qwen3d.data_video.build import (
     get_multiple_train_2d_dataset_dicts,
     get_multiple_train_3d_dataset_dicts,
@@ -143,6 +164,80 @@ def create_ddp_model(
     return ddp
 
 
+def vlmcd_metric_prefix(dataset_name):
+    """Metric prefix of ``vlmcd_<task>_<split>``: ``val_<task>``, ``test_<task>``, or
+    ``train_eval_<task>`` (generation eval on a fixed train subset; ``train/`` holds the
+    running training metrics)."""
+    split = dataset_name.rsplit("_", 1)[-1]
+    split = "train_eval" if split == "train" else split
+    return f"{split}_{dataset_task(dataset_name)}"
+
+
+def pool_vlmcd_results(results, dataset_names):
+    """``<split>_all/<metric>``: teacher-forced loss / accuracy pooled over the vlmcd tasks.
+
+    Losses and ``seq_acc`` are averaged over examples (like the training loss) and
+    ``token_acc`` over answer tokens, so ``val_all/total_loss`` compares with ``total_loss``.
+    """
+    groups = {}
+    for name in dataset_names:
+        r = results.get(name) or {}
+        if r.get("num_examples"):
+            groups.setdefault(vlmcd_metric_prefix(name).rsplit("_", 1)[0], []).append(r)
+    out = {}
+    for split, rs in groups.items():
+        n = sum(r["num_examples"] for r in rs)
+        for k in ("total_loss", "lm_loss", "seq_acc"):
+            if all(k in r for r in rs):
+                out[f"{split}_all/{k}"] = sum(r[k] * r["num_examples"] for r in rs) / n
+        tok = sum(r.get("answer_tokens", 0.0) for r in rs)
+        if tok and all("token_acc" in r for r in rs):
+            out[f"{split}_all/token_acc"] = sum(r["token_acc"] * r["answer_tokens"] for r in rs) / tok
+    return out
+
+
+def log_vlmcd_results(results, logger):
+    """One log line per metric prefix (val_all, val_describe, ...), losses first."""
+    groups = {}
+    for k, v in results.items():
+        prefix, _, metric = k.partition("/")
+        groups.setdefault(prefix, {})[metric] = v
+    first = ("total_loss", "lm_loss", "token_acc", "seq_acc")
+    for prefix, m in sorted(groups.items(), key=lambda kv: (not kv[0].endswith("_all"), kv[0])):
+        keys = [k for k in first if k in m] + sorted(k for k in m if k not in first)
+        logger.info(f"eval {prefix}: " + "  ".join(f"{k}: {m[k]:.4g}" for k in keys))
+
+
+class TrainMetricPrinter(CommonMetricPrinter):
+    """Console progress line without the eval metrics, plus the training accuracies.
+
+    The stock printer shows every key containing "loss" as a 20-iteration median; eval keys
+    (``val_*`` etc., written once per eval) would show a stale median of past evals, so they
+    are left out here and ``Trainer.test`` logs them when they are computed. Accuracies
+    (``train/*acc``) get their own line, median-smoothed like the losses.
+    """
+
+    EVAL_PREFIXES = ("val_", "test_", "train_eval_")
+
+    def write(self):
+        storage = get_event_storage()
+        histories = storage.histories()
+        hidden = {k: histories.pop(k) for k in list(histories) if k.startswith(self.EVAL_PREFIXES)}
+        try:
+            super().write()
+        finally:
+            histories.update(hidden)
+        if storage.iter == self._max_iter:
+            return
+        accs = [
+            f"{k}: {v.median(max(storage.count_samples(k, self._window_size), 1)):.4g}"
+            for k, v in histories.items()
+            if k.startswith("train/") and k.endswith("acc")
+        ]
+        if accs:
+            self.logger.info(f" iter: {storage.iter}  " + "  ".join(accs))
+
+
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
@@ -198,15 +293,19 @@ class Trainer(DefaultTrainer):
         data_time: float,
         cur_iter: int,
         prefix: str = "",
+        extra_metrics: Optional[Mapping[str, float]] = None,
     ) -> None:
         """
         Args:
             loss_dict (dict): dict of scalar losses
             data_time (float): time taken by the dataloader iteration
             prefix (str): prefix for logging keys
+            extra_metrics (dict): scalars logged as-is (averaged over the ranks that
+                report them), not added to total_loss, e.g. training accuracies
         """
         metrics_dict = {k: v.detach().cpu().item() for k, v in loss_dict.items()}
         metrics_dict["data_time"] = data_time
+        all_extra = comm.gather(dict(extra_metrics or {}))
 
         storage = get_event_storage()
         # Keep track of data time per rank
@@ -240,19 +339,27 @@ class Trainer(DefaultTrainer):
             if len(metrics_dict) > 1:
                 storage.put_scalars(cur_iter=cur_iter, **metrics_dict)
 
+            extra = {}
+            for d in all_extra:
+                for k, v in d.items():
+                    extra.setdefault(k, []).append(v)
+            if extra:
+                storage.put_scalars(cur_iter=cur_iter, **{k: float(np.mean(v)) for k, v in extra.items()})
+
     def _write_metrics(
         self,
         loss_dict: Mapping[str, torch.Tensor],
         data_time: float,
         prefix: str = "",
         iter: Optional[int] = None,
+        extra_metrics: Optional[Mapping[str, float]] = None,
     ) -> None:
         logger = logging.getLogger(__name__)
 
         iter = self.iter if iter is None else iter
         if (iter + 1) % self._trainer.gather_metric_period == 0:
             try:
-                self.write_metrics(loss_dict, data_time, iter, prefix)
+                self.write_metrics(loss_dict, data_time, iter, prefix, extra_metrics)
             except Exception:
                 logger.exception("Exception in writing metrics: ")
                 raise
@@ -524,6 +631,13 @@ class Trainer(DefaultTrainer):
         else:
             raise NotImplementedError
 
+    def build_writers(self):
+        writers = super().build_writers()
+        return [
+            TrainMetricPrinter(self.max_iter) if type(w) is CommonMetricPrinter else w
+            for w in writers
+        ]
+
     def build_hooks(self):
         """
         Build a list of default hooks, including timing, evaluation,
@@ -562,9 +676,16 @@ class Trainer(DefaultTrainer):
             ret.append(
                 hooks.PeriodicCheckpointer(
                     self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD,
-                    max_to_keep=15,
+                    max_to_keep=cfg.SOLVER.MAX_TO_KEEP or None,
                 )
             )
+            if cfg.SOLVER.SAVE_LAST_ITERS > 0:
+                ret.append(
+                    LastItersCheckpointer(
+                        self.checkpointer, cfg.SOLVER.SAVE_LAST_ITERS,
+                        cfg.SOLVER.CHECKPOINT_PERIOD,
+                    )
+                )
 
         def test_and_save_results():
             self._last_eval_results = self.test(self.cfg, self.model)
@@ -797,7 +918,20 @@ class Trainer(DefaultTrainer):
         torch.cuda.empty_cache()
 
         results_structured = {}
+        vlmcd_names = [n for n in dataset_names if n.startswith("vlmcd_")]
+        for dataset_name in vlmcd_names:
+            # One prefix per dataset: the generic naming below gives every vlmcd set the
+            # same "val_full_vlmcd" prefix, so the count metrics overwrote describe's.
+            results_structured.update({
+                f"{vlmcd_metric_prefix(dataset_name)}/{k}": v
+                for k, v in results[dataset_name].items()
+            })
+        results_structured.update(pool_vlmcd_results(results, vlmcd_names))
+        log_vlmcd_results(results_structured, logger)
+
         for dataset_name in dataset_names:
+            if dataset_name.startswith("vlmcd_"):
+                continue
             if dataset_name in cfg.DATASETS.TEST_2D_ONLY:
                 suffix = "train" if "train_eval" in dataset_name else "val"
             else:
@@ -846,6 +980,13 @@ class Trainer(DefaultTrainer):
 
         with autocast(dtype=self._trainer.precision):
             loss_dict = self._trainer.model(data)
+            train_metrics = {}
+            if isinstance(loss_dict, dict):
+                # metric_* entries (answer-token accuracy, unweighted LM loss) are logged only.
+                train_metrics = self._train_metric_names(
+                    {k[len("metric_"):]: loss_dict.pop(k) for k in list(loss_dict) if k.startswith("metric_")},
+                    data,
+                )
             if isinstance(loss_dict, torch.Tensor):
                 losses = loss_dict
                 loss_dict = {"total_loss": loss_dict}
@@ -876,8 +1017,23 @@ class Trainer(DefaultTrainer):
             losses.backward()
         self._trainer.after_backward()
 
-        self._write_metrics(loss_dict, data_time)
+        self._write_metrics(loss_dict, data_time, extra_metrics=train_metrics)
         return optimizer
+
+    @staticmethod
+    def _train_metric_names(metrics, data):
+        """``train/<name>`` for the batch, plus ``train/<task>_<name>`` for vlmcd tasks.
+
+        Accuracies use the same names as the eval metrics (``val_<task>/token_acc``, ...)
+        so the two can be compared; ``n_tokens`` (answer length) is not logged.
+        """
+        metrics = {k: float(v) for k, v in metrics.items() if k != "n_tokens"}
+        out = {f"train/{k}": v for k, v in metrics.items()}
+        name = data[0].get("dataset_name", "") if data else ""
+        if name.startswith("vlmcd_"):
+            task = dataset_task(name)
+            out.update({f"train/{task}_{k}": v for k, v in metrics.items()})
+        return out
 
     def run_step(self):
         if self.cfg.DATALOADER_ONLY:

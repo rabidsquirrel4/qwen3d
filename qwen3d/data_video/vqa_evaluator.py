@@ -93,6 +93,37 @@ def vlmcd_metrics(dataset_name, res):
     return out
 
 
+def teacher_forced_metrics(records):
+    """Validation loss and accuracy, aggregated like the training metrics.
+
+    Parameters
+    ----------
+    records : list of dict
+        Per-example records; those with a ``teacher_forced`` entry (from the model's
+        ``eval_loss`` pass) are used.
+
+    Returns
+    -------
+    dict
+        ``total_loss`` (weighted as in training) and ``lm_loss`` (cross-entropy per answer
+        token) averaged over examples, like the training loss; ``token_acc`` over all answer
+        tokens; ``seq_acc``, the share of answers right token-for-token; ``num_examples`` and
+        ``answer_tokens`` (to pool datasets). Empty if no record has the stats.
+    """
+    stats = [r["teacher_forced"] for r in records if r.get("teacher_forced")]
+    if not stats:
+        return {}
+    n_tok = sum(s.get("n_tokens", 0.0) for s in stats)
+    out = {k: float(np.mean([s[k] for s in stats])) for k in ("total_loss", "lm_loss", "seq_acc")
+           if all(k in s for s in stats)}
+    if "token_acc" in stats[0]:
+        out["token_acc"] = (sum(s["token_acc"] * s["n_tokens"] for s in stats) / n_tok
+                            if n_tok else float(np.mean([s["token_acc"] for s in stats])))
+    out.update(num_examples=float(len(stats)), answer_tokens=float(n_tok))
+    print("teacher-forced: " + ", ".join(f"{k}: {v:.4f}" for k, v in out.items()))
+    return out
+
+
 class VQAEvaluator(DatasetEvaluator):
     def __init__(
         self,
@@ -153,12 +184,16 @@ class VQAEvaluator(DatasetEvaluator):
                     self.results.append((outputs[0][i].lower(), [answer.lower() for answer in inputs[0]['sr3d_data'][i]['answers']]))
                 elif self.dataset_name.startswith('vlmcd_'):
                     self.results.append((outputs[0][i].lower().strip(), [answer.lower() for answer in inputs[0]['sr3d_data'][i]['answers']]))
-                    self.vlmcd_records.append({
+                    record = {
                         "example_id": inputs[0]['sr3d_data'][i]['example_id'],
                         "frame_ids": inputs[0].get('frame_ids'),
                         "prediction": outputs[0][i].strip(),
                         "answer": inputs[0]['sr3d_data'][i]['answers'][0],
-                    })
+                    }
+                    if len(outputs) > 2 and outputs[2]:
+                        # Teacher-forced stats of the example (model eval_loss pass, bs == 1).
+                        record["teacher_forced"] = outputs[2]
+                    self.vlmcd_records.append(record)
             else:
                 if self.dataset_name == "mmlupro_text_bench":
                     self.results.append((outputs[0][i].lower(), inputs[i]['answer'].lower()))
@@ -235,6 +270,7 @@ class VQAEvaluator(DatasetEvaluator):
 
         if self.dataset_name.startswith('vlmcd_'):
             eval_results.update(vlmcd_metrics(self.dataset_name, res))
+            eval_results.update(teacher_forced_metrics(self.vlmcd_records))
             self._save_vlmcd_predictions(eval_results)
 
         if is_dist_avail_and_initialized():

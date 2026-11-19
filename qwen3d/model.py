@@ -824,6 +824,42 @@ class Qwen3D(nn.Module):
 
         return starts, ends
 
+    @staticmethod
+    @torch.no_grad()
+    def _answer_token_stats(logits, labels, answer_start):
+        """Teacher-forced accuracy on the answer span (the tokens the LM loss covers).
+
+        Parameters
+        ----------
+        logits : Tensor
+            ``[B, L - answer_start + 1, V]``: the modified Qwen forward only projects the
+            hidden states from ``answer_start - 1`` on (``generate_mode``).
+        labels : Tensor
+            ``[B, L]``, ``-100`` outside the answer span.
+        answer_start : Tensor
+            ``[B]``, first answer position; equal across the batch (``bs == 1``).
+
+        Returns
+        -------
+        dict of Tensor
+            ``token_acc``: share of answer tokens whose argmax prediction is right.
+            ``seq_acc``: share of examples with every answer token right (teacher-forced
+            exact match). ``n_tokens``: answer tokens per example.
+        """
+        start = int(answer_start.reshape(-1)[0])
+        pred = logits[:, :-1].argmax(-1)  # position j predicts labels[:, start + j]
+        target = labels[:, start:]
+        n = min(pred.shape[1], target.shape[1])
+        pred, target = pred[:, :n], target[:, :n]
+        valid = target != -100
+        correct = (pred == target) & valid
+        n_tok = valid.sum(1)
+        return {
+            "token_acc": correct.sum().float() / n_tok.sum().clamp(min=1),
+            "seq_acc": (correct.sum(1) == n_tok).float().mean(),
+            "n_tokens": n_tok.float().mean(),
+        }
+
     def _prepare_pixel_values(self, batched_inputs):
         """Stack dataloader-precomputed pixel_values / image_grid_thw for self.visual."""
         precomputed_pv = batched_inputs[0]["qwen_pixel_values"]
@@ -950,15 +986,37 @@ class Qwen3D(nn.Module):
                   expression, target id, anchor ids, positive map, etc.).
                 - ``dataset_name`` / ``num_classes`` / ``all_classes``: dataset
                   metadata used to build per-batch class prompts.
+                - ``eval_loss`` (bool, optional, eval of ``generate_only`` samples):
+                  also run a teacher-forced pass on the reference answer.
+                - ``teacher_forced`` (bool, optional, set internally): score the
+                  reference answer instead of generating.
 
         Returns:
-            During training: a dict of scalar losses.
+            During training: a dict of scalar losses. ``generate_only`` samples also
+            carry ``metric_*`` entries (answer-token accuracy etc.) that are logged,
+            not optimized.
             During eval: ``processed_results`` (list[dict]), and if a
             text-generation dataset is active, ``(generation_language,
-            processed_results)``.
+            processed_results)``. With ``eval_loss``, a third element holds the
+            teacher-forced stats of the example (see ``_answer_token_stats``).
         """
         assert torch.get_autocast_dtype(device_type="cuda") == torch.bfloat16, (
             "We want to train this model in bfloat16"
+        )
+
+        if (not self.training and batched_inputs[0].get("eval_loss", False)
+                and not batched_inputs[0].get("teacher_forced", False)):
+            # Validation loss: score the reference answer exactly as training does (same
+            # template, labels and loss weights), then generate as usual. Shallow copies:
+            # forward does not modify the inputs in place.
+            tf = self.forward([{**b, "teacher_forced": True} for b in batched_inputs])
+            out = self.forward([{**b, "eval_loss": False} for b in batched_inputs])
+            return (*out, {k: float(v) for k, v in tf.items()})
+
+        # Use the reference answer (training template, labels, loss) rather than generate.
+        teacher_forced = self.training or batched_inputs[0].get("teacher_forced", False)
+        assert self.training or not teacher_forced or batched_inputs[0].get("generate_only", False), (
+            "teacher_forced eval is only implemented for generate_only samples"
         )
 
         # NOTE: bs == 1 is enforced below; the sum / >0 idiom is kept so this
@@ -1108,10 +1166,11 @@ class Qwen3D(nn.Module):
                     pointcloud, featurecloud, pixel_indices, point2voxel,
                     target_points=4096 if self.training else _cap,
                 )
-            if self.training and self.cfg.GENERATION:
+            if teacher_forced and self.cfg.GENERATION:
                 if actual_decoder_3d:
+                    pick = random.choice if self.training else (lambda a: a[0])
                     answers = [
-                        random.choice(sample["sr3d_data"][0]["answers"])
+                        pick(sample["sr3d_data"][0]["answers"])
                         if "sr3d_data" in sample and "answers" in sample["sr3d_data"][0]
                         else ""
                         for sample in batched_inputs
@@ -1131,13 +1190,13 @@ class Qwen3D(nn.Module):
         text_input = []
         for i in range(bs):
             if batched_inputs[0].get("text_only", False):
-                template = TEXT_INPUT_TRAIN if self.training else TEXT_INPUT_GEN
+                template = TEXT_INPUT_TRAIN if teacher_forced else TEXT_INPUT_GEN
             elif decoder_3d:
-                template = TEXT_INPUT_TRAIN_3D if self.training else TEXT_INPUT_GEN_3D
+                template = TEXT_INPUT_TRAIN_3D if teacher_forced else TEXT_INPUT_GEN_3D
             else:
-                template = TEXT_INPUT_TRAIN_2D if self.training else TEXT_INPUT_GEN_2D
+                template = TEXT_INPUT_TRAIN_2D if teacher_forced else TEXT_INPUT_GEN_2D
 
-            if self.training:
+            if teacher_forced:
                 text_input.append(
                     template.format(target_sentence=target_sentence[i], answer=answers[i])
                 )
@@ -1254,7 +1313,8 @@ class Qwen3D(nn.Module):
                 "generate_only/do_generate is True but cfg.GENERATION is False"
             )
 
-        if self.training or not generation:
+        text_stats = None
+        if teacher_forced or not generation:
             inputs["output_hidden_states"] = True
             inputs["labels"] = torch.full_like(inputs["input_ids"], -100, dtype=torch.long)
             answer_end = (
@@ -1299,6 +1359,10 @@ class Qwen3D(nn.Module):
             text_head_outputs = self.qwen_model(**inputs)
             text_output_features = text_head_outputs.hidden_states[-1]
             text_loss = text_head_outputs.loss
+            if teacher_forced and text_head_outputs.logits is not None:
+                text_stats = self._answer_token_stats(
+                    text_head_outputs.logits, inputs["labels"], answer_start
+                )
         else:
             inputs["use_cache"] = True
             if not batched_inputs[0].get("text_only", False):
@@ -1325,7 +1389,7 @@ class Qwen3D(nn.Module):
         # Generation-only datasets (text benchmarks) short-circuit before the
         # mask decoder.
         if batched_inputs[0].get("generate_only", False):
-            if self.training:
+            if teacher_forced:
                 losses = {}
                 if text_loss is not None:
                     losses["loss_generation"] = text_loss
@@ -1336,6 +1400,18 @@ class Qwen3D(nn.Module):
                     else:
                         losses.pop(k)
 
+                # Logged, not optimized: the unweighted LM loss and answer-token accuracy.
+                metrics = dict(text_stats or {})
+                if text_loss is not None:
+                    metrics["lm_loss"] = text_loss
+                metrics = {k: v.detach().float() for k, v in metrics.items()}
+
+                if not self.training:
+                    # Teacher-forced eval pass: total_loss is what training logs as total_loss.
+                    if losses:
+                        metrics["total_loss"] = sum(losses.values()).detach().float()
+                    return metrics
+
                 if (
                     self.cfg.MULTI_TASK_TRAINING
                     and not self.cfg.IID_MULTITASK_TRAINING
@@ -1345,6 +1421,9 @@ class Qwen3D(nn.Module):
                         losses["loss_3d"] = sum(losses.values())
                     else:
                         losses["loss_2d"] = sum(losses.values())
+                # Added after the loss_3d / loss_2d sums; Trainer.run_fwd_bwd pops metric_*
+                # before summing the losses.
+                losses.update({f"metric_{k}": v for k, v in metrics.items()})
                 return losses
             return text_decoded, None
 

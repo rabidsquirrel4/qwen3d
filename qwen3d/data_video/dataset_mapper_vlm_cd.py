@@ -20,7 +20,8 @@ One sample is one example (room + its changes) and one question (see
 
 The output is a ``generate_only`` sample: the model trains with the language-modelling
 loss on the answer, and the mask decoder / ghost points are skipped
-(``skip_ghost_points``).
+(``skip_ghost_points``). At eval, ``eval_loss`` (``cfg.VLMCD.EVAL_LOSS``) makes the model
+also score the reference answer, so validation reports the training loss and accuracy too.
 """
 
 import hashlib
@@ -432,4 +433,6 @@ class VlmCdDatasetMapper:
             "max_frames": num_views,
             "use_ghost": False,
             "pseudo_2d_aug": False,
+            # Eval: the model also scores the reference answer (teacher-forced loss / accuracy).
+            "eval_loss": (not self.is_train) and bool(self.vc.EVAL_LOSS),
         }
