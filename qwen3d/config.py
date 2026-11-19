@@ -183,6 +183,7 @@ def add_maskformer2_video_config(cfg):
     cfg.CACHE_QWEN_FEATURES = False
     cfg.ROPE_TYPE = "custom_txyz"
     cfg.GRADIENT_CHECKPOINTING = False
+    cfg.COMPILE_LLM = False  # torch.compile each LLM decoder layer (dynamic shapes); 3D front end stays eager
     cfg.CAUSAL_MASK = False
     cfg.INTERP_NEIGHBORS = 8
     cfg.MODEL.INTERPOLATION_METHOD = "nearest"
@@ -406,7 +407,9 @@ def add_maskformer2_video_config(cfg):
     cfg.DEPTH_NOISE_STD = 0.01
     cfg.TEST_DATASET_INFERENCE = False
     cfg.TEST_RESULT_EXPORT_PATH = None
-    cfg.WANDB_ENTITY = "katef_odin"
+    # None: wandb uses $WANDB_ENTITY, else the logged-in account's default entity. (Was the upstream
+    # authors' "katef_odin", which syncs from other accounts are refused with HTTP 403.)
+    cfg.WANDB_ENTITY = None
     cfg.AR_LLM = False
     cfg.AR_EMBED = False
     cfg.AR_INSTRUCT = False
@@ -465,6 +468,9 @@ def add_maskformer2_video_config(cfg):
     cfg.VLMCD.ONLY_VISIBLE_CHANGES = True  # answers list only changes seen in the chosen frames
     cfg.VLMCD.MIN_VISIBLE_PIXELS = 20    # pixels (at 256 px) for a change to count as seen
     cfg.VLMCD.ANSWER_ORDER = "size"      # describe clauses: by action, then largest object first ("dataset": as stored)
+    # "json": describe = JSON array of {action, class, distance_m (moved objects seen in
+    # both scans)}, count = {"moved": n, ...}; "text": the earlier "moved the vase ... by 6.4 m; ..."
+    cfg.VLMCD.ANSWER_FORMAT = "json"
     cfg.VLMCD.RETRIES = 5                # Hub read attempts per example
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming
