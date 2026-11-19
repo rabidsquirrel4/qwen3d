@@ -335,8 +335,10 @@ class VlmCdDatasetMapper:
         if self.vc.ONLY_VISIBLE_CHANGES:
             changes = visible_changes(changes, fr["visibility"], before_ids, after_ids,
                                       self.vc.MIN_VISIBLE_PIXELS)
-        prompt = question(self.task, self.vc.STATE_ENCODING, self.vc.ANSWER_FORMAT)
-        target = answer(self.task, changes, self.vc.ANSWER_ORDER, self.vc.ANSWER_FORMAT)
+        prompt = question(self.task, self.vc.STATE_ENCODING, self.vc.ANSWER_FORMAT,
+                          self.vc.ANSWER_ORDER, self.vc.ANSWER_VOLUME)
+        target = answer(self.task, changes, self.vc.ANSWER_ORDER, self.vc.ANSWER_FORMAT,
+                        self.vc.ANSWER_VOLUME)
 
         native = fr["rgb_before"].shape[1]
         size = int(self.vc.IMAGE_SIZE) if self.vc.IMAGE_SIZE > 0 else native

@@ -19,9 +19,13 @@ Tasks:
 ``describe``
     "List every object that was moved, added or removed." With ``VLMCD.ANSWER_FORMAT json``
     (the default) the answer is a JSON array with one entry per change, e.g.
-    ``[{"action":"moved","class":"vase","distance_m":6.4},{"action":"removed","class":"statue"}]``
+    ``[{"action":"moved","class":"vase","volume_m3":0.00213,"distance_m":6.4},
+    {"action":"removed","class":"statue","volume_m3":0.0151}]``
     (no support surface, unlike ``text``: it is not scored, and leaving it out keeps
-    answers under the generation limit). ``distance_m`` (how far
+    answers under the generation limit). ``volume_m3`` (``VLMCD.ANSWER_VOLUME``, the
+    object-frame bounding-box volume from ``prepare_vlm_cd.py``, 3 significant digits) is
+    the key ``VLMCD.ANSWER_ORDER size`` sorts by, so the target shows why entries come in
+    their order. ``distance_m`` (how far
     the object's origin travelled, from the dataset's ``displacement_meters``) is given
     only for moved objects seen in both scans, the only ones whose distance the model can
     measure. With ``text`` it is one clause per change, e.g. ``moved the vase on the
@@ -32,9 +36,11 @@ Tasks:
 """
 
 import json
+import math
 import os
 import re
 from collections import Counter
+from decimal import Decimal
 
 from detectron2.data import DatasetCatalog, MetadataCatalog
 
@@ -46,6 +52,7 @@ PAST = {"move": "moved", "add": "added", "remove": "removed"}
 PRESENT = {v: k for k, v in PAST.items()}
 ANSWER_FORMATS = ("json", "text")
 DISTANCE_DECIMALS = 2  # centimetres: a tenth of moves travel under 0.2 m
+VOLUME_DIGITS = 3      # significant digits of volume_m3 (objects span ~1e-5 to ~1 m^3)
 
 _INDEX_CACHE = {}
 
@@ -197,35 +204,64 @@ def has_distance(change):
             and change.get("seen_before", True) and change.get("seen_after", True))
 
 
-def change_record(change):
+def round_significant(x, digits=VOLUME_DIGITS):
+    """``x`` rounded to ``digits`` significant digits (0 stays 0)."""
+    x = float(x)
+    if x == 0 or not math.isfinite(x):
+        return x
+    return round(x, digits - 1 - math.floor(math.log10(abs(x))))
+
+
+def change_record(change, volume=True):
     """One entry of a ``json`` ``describe`` answer.
 
     Parameters
     ----------
     change : dict
         An index change record.
+    volume : bool
+        Add ``volume_m3`` (``VLMCD.ANSWER_VOLUME``).
 
     Returns
     -------
     dict
-        ``action`` (``moved`` / ``added`` / ``removed``), ``class``, and ``distance_m`` when
+        ``action`` (``moved`` / ``added`` / ``removed``), ``class``, ``volume_m3`` (when
+        ``volume`` and the index knows the object's size), and ``distance_m`` when
         ``has_distance``.
+
+    Raises
+    ------
+    KeyError
+        ``volume`` is set but the index was built without object sizes.
     """
     rec = {"action": PAST[change["action"]], "class": change["category"]}
+    if volume:
+        if "volume_m3" not in change:
+            raise KeyError(NO_SIZES + " or set VLMCD.ANSWER_VOLUME False")
+        if change["volume_m3"] is not None:
+            rec["volume_m3"] = round_significant(change["volume_m3"])
     if has_distance(change):
         rec["distance_m"] = round(float(change["displacement_m"]), DISTANCE_DECIMALS)
     return rec
 
 
+_EXPONENT_NUMBER = re.compile(r"(?<=[:,\[])(-?\d+(?:\.\d+)?[eE][-+]?\d+)")
+
+
 def _json(obj):
-    """Compact JSON (fewer tokens to generate)."""
-    return json.dumps(obj, separators=(",", ":"))
+    """Compact JSON (fewer tokens to generate), numbers always in positional notation.
+
+    ``json.dumps`` writes floats below 1e-4 as ``1.4e-05``; small volumes would then mix
+    notations with the rest, so those are rewritten as ``0.000014``.
+    """
+    text = json.dumps(obj, separators=(",", ":"))
+    return _EXPONENT_NUMBER.sub(lambda m: format(Decimal(m.group(1)), "f"), text)
 
 
 STATE_ENCODINGS = ("time", "offset")
 
 
-def question(task, state_encoding="time", answer_format="json"):
+def question(task, state_encoding="time", answer_format="json", order="size", volume=True):
     """The prompt for a task.
 
     How the two scans reach the model depends on ``VLMCD.STATE_ENCODING`` (see
@@ -245,6 +281,10 @@ def question(task, state_encoding="time", answer_format="json"):
         One of ``STATE_ENCODINGS``.
     answer_format : str
         One of ``ANSWER_FORMATS``.
+    order : str
+        ``VLMCD.ANSWER_ORDER``; with ``size`` a ``json`` ``describe`` prompt states the order.
+    volume : bool
+        ``VLMCD.ANSWER_VOLUME``; a ``json`` ``describe`` prompt then asks for ``volume_m3``.
 
     Returns
     -------
@@ -261,10 +301,16 @@ def question(task, state_encoding="time", answer_format="json"):
     else:
         raise ValueError(f"unknown VLMCD.STATE_ENCODING {state_encoding!r}; expected one of {STATE_ENCODINGS}")
     if task == "describe" and answer_format == "json":
-        return intro + ("List every object that was moved, added or removed as a JSON array "
-                        "with one entry per object: "
-                        '{"action": "moved", "added" or "removed", "class": the object category, '
-                        '"distance_m": for a moved object, how far it moved in metres}.')
+        fields = '{"action": "moved", "added" or "removed", "class": the object category, '
+        if volume:
+            fields += '"volume_m3": its bounding-box volume in cubic metres, '
+        fields += '"distance_m": for a moved object, how far it moved in metres}.'
+        text = ("List every object that was moved, added or removed as a JSON array "
+                "with one entry per object: " + fields)
+        if order == "size":
+            text += (" List the moved objects first, then the added, then the removed; "
+                     "within each, the largest object first.")
+        return intro + text
     if task == "describe":
         return intro + ("List every object that was moved, added or removed, "
                         "separated by semicolons.")
@@ -277,6 +323,8 @@ def question(task, state_encoding="time", answer_format="json"):
 
 
 ORDERS = ("size", "dataset")
+NO_SIZES = ("index.json has no object sizes; rebuild it with `python vlm_cd/prepare_vlm_cd.py` "
+            "(pyarrow >= 26, e.g. `sbatch vlm_cd/prepare_vlm_cd_slurm.sh`)")
 
 
 def order_changes(changes, order="size"):
@@ -304,14 +352,13 @@ def order_changes(changes, order="size"):
     if order != "size":
         raise ValueError(f"unknown VLMCD.ANSWER_ORDER {order!r}; expected one of {ORDERS}")
     if any("volume_m3" not in c for c in changes):
-        raise KeyError("index.json has no object sizes; rebuild it with "
-                       "`python vlm_cd/prepare_vlm_cd.py` or set VLMCD.ANSWER_ORDER dataset")
+        raise KeyError(NO_SIZES + " or set VLMCD.ANSWER_ORDER dataset")
     # Identical objects (two chairs of one set) tie on volume; the clause text then decides.
     return sorted(changes, key=lambda c: (ACTIONS.index(c["action"]), -(c["volume_m3"] or 0.0),
                                           change_clause(c)))
 
 
-def answer(task, changes, order="size", answer_format="json"):
+def answer(task, changes, order="size", answer_format="json", volume=True):
     """The target answer for a task.
 
     Parameters
@@ -324,6 +371,8 @@ def answer(task, changes, order="size", answer_format="json"):
         Clause order of ``describe`` answers, see ``order_changes``.
     answer_format : str
         One of ``ANSWER_FORMATS``.
+    volume : bool
+        Give each ``json`` ``describe`` entry its ``volume_m3`` (``VLMCD.ANSWER_VOLUME``).
 
     Returns
     -------
@@ -333,7 +382,7 @@ def answer(task, changes, order="size", answer_format="json"):
         raise ValueError(f"unknown VLMCD.ANSWER_FORMAT {answer_format!r}; expected one of {ANSWER_FORMATS}")
     if answer_format == "json":
         if task == "describe":
-            return _json([change_record(c) for c in order_changes(changes, order)])
+            return _json([change_record(c, volume) for c in order_changes(changes, order)])
         if task == "count":
             n = Counter(c["action"] for c in changes)
             return _json({PAST[a]: n[a] for a in ACTIONS})

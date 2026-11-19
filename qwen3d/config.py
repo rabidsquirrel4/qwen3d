@@ -471,6 +471,9 @@ def add_maskformer2_video_config(cfg):
     # "json": describe = JSON array of {action, class, distance_m (moved objects seen in
     # both scans)}, count = {"moved": n, ...}; "text": the earlier "moved the vase ... by 6.4 m; ..."
     cfg.VLMCD.ANSWER_FORMAT = "json"
+    # json describe entries carry "volume_m3" (object bounding-box volume, the ANSWER_ORDER size
+    # sort key), so the target shows the size the order follows. Needs object sizes in index.json.
+    cfg.VLMCD.ANSWER_VOLUME = True
     cfg.VLMCD.RETRIES = 5                # Hub read attempts per example
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming
