@@ -471,6 +471,24 @@ def add_maskformer2_video_config(cfg):
     # "json": describe = JSON array of {action, class, distance_m (moved objects seen in
     # both scans)}, count = {"moved": n, ...}; "text": the earlier "moved the vase ... by 6.4 m; ..."
     cfg.VLMCD.ANSWER_FORMAT = "json"
+    # Map -> single view: the before scan (FRAMES_PER_STATE frames) is the map, the after scan
+    # only AFTER_FRAMES RGB-D views (0: the usual FRAMES_PER_STATE / SAME_FRAMES views). The
+    # answer then lists the changes those views reveal (visible_changes_from_view). Needs an
+    # index from prepare_vlm_cd.py with visible frame lists.
+    cfg.VLMCD.AFTER_FRAMES = 0
+    # With AFTER_FRAMES: share of samples whose views come from frames showing some change
+    # (the dataset's visibility lists); the rest come from all frames.
+    cfg.VLMCD.VIEW_CHANGE_PROB = 0.9
+
+    # Point encoder fused in voxel space (qwen3d/modeling/voxel_point_encoder.py): a PointNet over
+    # the raw points inside each 5 cm voxel token, added to the voxel's image feature through a
+    # zero-initialised projection. Points: the dataset's point cloud for the before scan (the map),
+    # the full-resolution depth back-projection for the after scan. Needs an index with point
+    # cloud locations (prepare_vlm_cd.py).
+    cfg.VOXEL_POINT_ENCODER = CN()
+    cfg.VOXEL_POINT_ENCODER.ENABLED = False
+    cfg.VOXEL_POINT_ENCODER.HIDDEN_DIM = 128
+    cfg.VOXEL_POINT_ENCODER.POINTS_PER_VOXEL = 32  # random subset of each voxel's points (mapper)
     cfg.VLMCD.RETRIES = 5                # Hub read attempts per example
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming

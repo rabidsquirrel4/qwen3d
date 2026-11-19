@@ -225,7 +225,7 @@ def _json(obj):
 STATE_ENCODINGS = ("time", "offset")
 
 
-def question(task, state_encoding="time", answer_format="json"):
+def question(task, state_encoding="time", answer_format="json", single_view=False):
     """The prompt for a task.
 
     How the two scans reach the model depends on ``VLMCD.STATE_ENCODING`` (see
@@ -245,6 +245,9 @@ def question(task, state_encoding="time", answer_format="json"):
         One of ``STATE_ENCODINGS``.
     answer_format : str
         One of ``ANSWER_FORMATS``.
+    single_view : bool
+        The after scan is a few camera views of the room, compared with a map
+        (``VLMCD.AFTER_FRAMES``); needs ``state_encoding="time"``.
 
     Returns
     -------
@@ -252,7 +255,12 @@ def question(task, state_encoding="time", answer_format="json"):
     """
     if answer_format not in ANSWER_FORMATS:
         raise ValueError(f"unknown VLMCD.ANSWER_FORMAT {answer_format!r}; expected one of {ANSWER_FORMATS}")
-    if state_encoding == "time":
+    if single_view:
+        if state_encoding != "time":
+            raise ValueError("VLMCD.AFTER_FRAMES needs VLMCD.STATE_ENCODING time")
+        intro = ("The first point cloud is a map of a room; the second is what a camera sees in "
+                 "the same room now, after some objects changed. Compare the view with the map. ")
+    elif state_encoding == "time":
         intro = ("The two point clouds show the same room scanned twice: the first before "
                  "and the second after some objects changed. ")
     elif state_encoding == "offset":
