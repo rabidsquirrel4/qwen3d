@@ -477,6 +477,14 @@ def add_maskformer2_video_config(cfg):
     # With ANSWER_ORDER size, the json describe prompt states the order. False drops that sentence,
     # reproducing the prompt of models trained on JSON answers before volumes were added.
     cfg.VLMCD.ORDER_IN_PROMPT = True
+    # Extra json describe fields for moved objects seen in both scans. "none": distance_m only;
+    # "orient": + rotation_deg; "finalpose": + rotation_deg and final_pose (translation_m [dx,dy,dz]
+    # and yaw_deg relative to the original pose). Needs move poses in index.json (prepare_vlm_cd.py).
+    cfg.VLMCD.ANSWER_POSE = "none"
+    # json describe entries also give world AABBs: bbox_before (moved / removed objects seen before)
+    # and bbox_after (moved / added objects seen after), {"center", "size"} in metres. Needs the
+    # AABB sizes in index.json (prepare_vlm_cd.py).
+    cfg.VLMCD.ANSWER_BBOX = False
     cfg.VLMCD.RETRIES = 5                # Hub read attempts per example
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming

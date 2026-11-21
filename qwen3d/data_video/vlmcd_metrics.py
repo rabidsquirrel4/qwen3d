@@ -10,6 +10,12 @@ Metric groups (``describe``):
 - **changes**: precision / recall / F1 of ``(action, class)`` pairs, and per-action F1.
 - **distances** (``move_dist_*``): for moved objects whose true distance is given (seen in
   both scans), paired with predicted moves of the same class.
+- **orientation** (``move_rot_*``, ``VLMCD.ANSWER_POSE`` orient / finalpose): absolute error in
+  degrees of ``rotation_deg`` over moved objects, paired like distances.
+- **final pose** (``move_pose_*``, ``finalpose``): for moves with a true ``final_pose``, the
+  error of its translation (metres, Euclidean) and yaw (degrees, wrapped to 180).
+- **boxes** (``bbox_*``, ``VLMCD.ANSWER_BBOX``): per state, true boxes of the same action and class
+  paired with predicted ones by centre distance; centre error in metres and 3D IoU.
 - **volumes** (``volume_*``): for every true entry with a ``volume_m3`` (``VLMCD.ANSWER_VOLUME``),
   paired with predicted entries of the same action and class. Volumes span five orders of
   magnitude, so errors are in log10 units or as ratios.
@@ -32,6 +38,7 @@ except ImportError:  # loaded by file path, with datasets/ on sys.path (score_vl
     import vlm_cd
 
 DIST_THRESHOLDS = (0.1, 0.25, 0.5)  # metres
+ROT_THRESHOLDS = (10, 30, 90)       # degrees
 VOLUME_RATIOS = (1.25, 2.0, 4.0)    # max(pred / true, true / pred)
 VOLUME_FLOOR = 1e-7                 # m^3; keeps logs finite for a 0 prediction
 
@@ -161,6 +168,97 @@ def distance_metrics(pairs, n_gt, n_missing):
     return out
 
 
+def rotation_metrics(pairs, n_gt, n_missing):
+    """``move_rot_*`` keys from ``match_values(..., "rotation_deg", ("move",))``."""
+    if not n_gt:
+        return {}
+    ae = np.abs([p - g for p, g in pairs]) if pairs else np.array([np.nan])
+    out = {"move_rot_mae_deg": float(np.mean(ae)), "move_rot_medae_deg": float(np.median(ae))}
+    for t in ROT_THRESHOLDS:
+        out[f"move_rot_acc_{t}deg"] = float(np.mean(ae <= t)) if pairs else 0.0
+    out["move_rot_pairs"] = float(len(pairs))
+    out["move_rot_missing"] = float(n_missing)
+    return out
+
+
+def pose_metrics(pr, gr):
+    """``move_pose_*`` keys: ``final_pose`` error of predicted vs true moves of one class.
+
+    Within each class, the predicted and true moves that carry a pose are paired one to one
+    by smallest translation error.
+    """
+    from scipy.optimize import linear_sum_assignment
+    errs, n_gt, n_missing = [], 0, 0
+    for cls in {e["category"] for e in gr if e["action"] == "move" and e["pose"]}:
+        g = [e["pose"] for e in gr if e["action"] == "move" and e["category"] == cls and e["pose"]]
+        p_all = [e for e in pr if e["action"] == "move" and e["category"] == cls]
+        p = [e["pose"] for e in p_all if e["pose"]]
+        n_gt += len(g)
+        if p:
+            cost = np.array([[np.linalg.norm(np.subtract(a[:3], b[:3])) for b in g] for a in p])
+            for r, c in zip(*linear_sum_assignment(cost)):
+                dyaw = abs((p[r][3] - g[c][3] + 180.0) % 360.0 - 180.0)
+                errs.append((cost[r, c], dyaw))
+        n_missing += max(0, min(len(g), len(p_all)) - len(p))
+    return errs, n_gt, n_missing
+
+
+def pose_summary(errs, n_gt, n_missing):
+    """Summary keys of ``pose_metrics``."""
+    if not n_gt:
+        return {}
+    t = np.array([e[0] for e in errs]) if errs else np.array([np.nan])
+    y = np.array([e[1] for e in errs]) if errs else np.array([np.nan])
+    out = {"move_pose_trans_mae_m": float(np.mean(t)), "move_pose_trans_medae_m": float(np.median(t)),
+           "move_pose_yaw_mae_deg": float(np.mean(y)), "move_pose_yaw_medae_deg": float(np.median(y))}
+    for d in DIST_THRESHOLDS:
+        out[f"move_pose_trans_acc_{d}m"] = float(np.mean(t <= d)) if errs else 0.0
+    out["move_pose_pairs"] = float(len(errs))
+    out["move_pose_missing"] = float(n_missing)
+    return out
+
+
+def bbox_iou(a, b):
+    """3D IoU of two ``(cx, cy, cz, dx, dy, dz)`` axis-aligned boxes."""
+    a, b = np.array(a, float), np.array(b, float)
+    lo = np.maximum(a[:3] - a[3:] / 2, b[:3] - b[3:] / 2)
+    hi = np.minimum(a[:3] + a[3:] / 2, b[:3] + b[3:] / 2)
+    inter = float(np.prod(np.clip(hi - lo, 0, None)))
+    union = float(np.prod(np.clip(a[3:], 0, None)) + np.prod(np.clip(b[3:], 0, None))) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def bbox_pairs(pr, gr):
+    """``(centre errors, IoUs, n_gt, n_missing)`` of predicted vs true boxes, both states."""
+    from scipy.optimize import linear_sum_assignment
+    errs, ious, n_gt, n_missing = [], [], 0, 0
+    for state in ("bbox_before", "bbox_after"):
+        for grp in {(e["action"], e["category"]) for e in gr if e[state]}:
+            g = [e[state] for e in gr if (e["action"], e["category"]) == grp and e[state]]
+            p_all = [e for e in pr if (e["action"], e["category"]) == grp]
+            p = [e[state] for e in p_all if e[state]]
+            n_gt += len(g)
+            if p:
+                cost = np.array([[np.linalg.norm(np.subtract(a[:3], b[:3])) for b in g] for a in p])
+                for r, c in zip(*linear_sum_assignment(cost)):
+                    errs.append(cost[r, c])
+                    ious.append(bbox_iou(p[r], g[c]))
+            n_missing += max(0, min(len(g), len(p_all)) - len(p))
+    return errs, ious, n_gt, n_missing
+
+
+def bbox_summary(errs, ious, n_gt, n_missing):
+    """``bbox_*`` keys from the accumulated ``bbox_pairs``."""
+    if not n_gt:
+        return {}
+    e = np.array(errs) if errs else np.array([np.nan])
+    i = np.array(ious) if ious else np.array([0.0])
+    return {"bbox_center_mae_m": float(np.mean(e)), "bbox_center_medae_m": float(np.median(e)),
+            "bbox_iou_mean": float(np.mean(i)), "bbox_iou_acc_0.25": float(np.mean(i >= 0.25)),
+            "bbox_iou_acc_0.5": float(np.mean(i >= 0.5)),
+            "bbox_pairs": float(len(errs)), "bbox_missing": float(n_missing)}
+
+
 def volume_metrics(pairs, n_gt, n_missing):
     """``volume_*`` keys from ``match_values(..., "volume_m3", log=True)``."""
     if not n_gt:
@@ -197,7 +295,9 @@ def describe_metrics(res, order="size"):
     out = {}
     tp = fp = fn = 0
     per = {a: [0, 0, 0] for a in vlm_cd.ACTIONS}
-    dist, vol = ([], 0, 0), ([], 0, 0)
+    dist, vol, rot = ([], 0, 0), ([], 0, 0), ([], 0, 0)
+    pose_errs, pose_gt, pose_missing = [], 0, 0
+    box_e, box_i, box_gt, box_missing = [], [], 0, 0
     n_json = n_trunc = 0
     json_task = False
     n_grouped = n_ordered_preds = n_conc = n_pairs = n_exact = n_exact_preds = n_self = n_self_preds = 0
@@ -215,6 +315,12 @@ def describe_metrics(res, order="size"):
         v = match_values(pr, gr, "volume_m3", log=True)
         dist = (dist[0] + d[0], dist[1] + d[1], dist[2] + d[2])
         vol = (vol[0] + v[0], vol[1] + v[1], vol[2] + v[2])
+        r = match_values(pr, gr, "rotation_deg", actions=("move",))
+        rot = (rot[0] + r[0], rot[1] + r[1], rot[2] + r[2])
+        pe, pg, pm = pose_metrics(pr, gr)
+        pose_errs, pose_gt, pose_missing = pose_errs + pe, pose_gt + pg, pose_missing + pm
+        be, bi, bg, bm = bbox_pairs(pr, gr)
+        box_e, box_i, box_gt, box_missing = box_e + be, box_i + bi, box_gt + bg, box_missing + bm
         if vlm_cd.is_json_answer(answers[0]):
             json_task = True
             n_json += vlm_cd.is_json_answer(pred)
@@ -238,6 +344,9 @@ def describe_metrics(res, order="size"):
     for a, (t, f_p, f_n) in per.items():
         out[f"{a}_f1"] = 2 * t / (2 * t + f_p + f_n) if t + f_p + f_n else 0.0
     out.update(distance_metrics(*dist))
+    out.update(rotation_metrics(*rot))
+    out.update(pose_summary(pose_errs, pose_gt, pose_missing))
+    out.update(bbox_summary(box_e, box_i, box_gt, box_missing))
     out.update(volume_metrics(*vol))
     if n_ordered_preds:
         out["order_grouped"] = n_grouped / n_ordered_preds

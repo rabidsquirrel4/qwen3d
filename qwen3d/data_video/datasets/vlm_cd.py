@@ -52,6 +52,8 @@ PAST = {"move": "moved", "add": "added", "remove": "removed"}
 PRESENT = {v: k for k, v in PAST.items()}
 ANSWER_FORMATS = ("json", "text")
 DISTANCE_DECIMALS = 2  # centimetres: a tenth of moves travel under 0.2 m
+POSES = ("none", "orient", "finalpose")  # VLMCD.ANSWER_POSE
+POSE_DECIMALS = 2      # centimetres for the translation of final_pose; angles use one decimal
 VOLUME_DIGITS = 3      # significant digits of volume_m3 (objects span ~1e-5 to ~1 m^3)
 
 _INDEX_CACHE = {}
@@ -212,7 +214,7 @@ def round_significant(x, digits=VOLUME_DIGITS):
     return round(x, digits - 1 - math.floor(math.log10(abs(x))))
 
 
-def change_record(change, volume=True):
+def change_record(change, volume=True, pose="none", bbox=False):
     """One entry of a ``json`` ``describe`` answer.
 
     Parameters
@@ -221,18 +223,29 @@ def change_record(change, volume=True):
         An index change record.
     volume : bool
         Add ``volume_m3`` (``VLMCD.ANSWER_VOLUME``).
+    pose : str
+        ``VLMCD.ANSWER_POSE``. ``orient`` adds ``rotation_deg`` (how far the object turned,
+        unsigned); ``finalpose`` adds that and ``final_pose``, the object's new pose relative
+        to its old one: ``translation_m`` (world-frame ``[dx, dy, dz]``) and ``yaw_deg``
+        (signed turn about the vertical axis). Both only where ``has_distance``.
+    bbox : bool
+        ``VLMCD.ANSWER_BBOX``: add ``bbox_before`` (moved and removed objects seen before)
+        and ``bbox_after`` (moved and added objects seen after), each the world axis-aligned
+        box ``{"center": [x, y, z], "size": [dx, dy, dz]}`` in metres.
 
     Returns
     -------
     dict
         ``action`` (``moved`` / ``added`` / ``removed``), ``class``, ``volume_m3`` (when
         ``volume`` and the index knows the object's size), and ``distance_m`` when
-        ``has_distance``.
+        ``has_distance``, then ``rotation_deg`` and ``final_pose`` per ``pose``, then the
+        boxes per ``bbox``.
 
     Raises
     ------
     KeyError
-        ``volume`` is set but the index was built without object sizes.
+        ``volume`` is set but the index was built without object sizes, or ``pose`` is set
+        but it was built without move poses.
     """
     rec = {"action": PAST[change["action"]], "class": change["category"]}
     if volume:
@@ -242,6 +255,23 @@ def change_record(change, volume=True):
             rec["volume_m3"] = round_significant(change["volume_m3"])
     if has_distance(change):
         rec["distance_m"] = round(float(change["displacement_m"]), DISTANCE_DECIMALS)
+        if pose != "none":
+            if "rotation_deg" not in change:
+                raise KeyError(NO_POSES)
+            if change["rotation_deg"] is not None:
+                rec["rotation_deg"] = change["rotation_deg"]
+            if pose == "finalpose" and change["delta_xyz_m"] is not None:
+                rec["final_pose"] = {
+                    "translation_m": [round(float(x), POSE_DECIMALS) + 0.0 for x in change["delta_xyz_m"]],  # + 0.0: no -0.0
+                    "yaw_deg": change["delta_yaw_deg"]}
+    if bbox:
+        if "aabb_extent_before" not in change:
+            raise KeyError(NO_POSES)
+        for state, acts in (("before", ("move", "remove")), ("after", ("move", "add"))):
+            c, e = change[f"center_{state}"], change[f"aabb_extent_{state}"]
+            if change["action"] in acts and change.get(f"seen_{state}", True) and c and e:
+                rec[f"bbox_{state}"] = {"center": [round(float(x), POSE_DECIMALS) for x in c],
+                                        "size": [round(float(x), POSE_DECIMALS) for x in e]}
     return rec
 
 
@@ -262,7 +292,7 @@ STATE_ENCODINGS = ("time", "offset")
 
 
 def question(task, state_encoding="time", answer_format="json", order="size", volume=True,
-             order_in_prompt=True):
+             order_in_prompt=True, pose="none", bbox=False):
     """The prompt for a task.
 
     How the two scans reach the model depends on ``VLMCD.STATE_ENCODING`` (see
@@ -289,6 +319,11 @@ def question(task, state_encoding="time", answer_format="json", order="size", vo
     order_in_prompt : bool
         ``VLMCD.ORDER_IN_PROMPT``; False leaves the order sentence out, which reproduces the
         prompt of models trained before it was added (JSON answers without volumes).
+    pose : str
+        ``VLMCD.ANSWER_POSE``; a ``json`` ``describe`` prompt then also asks for
+        ``rotation_deg`` (``orient``) and ``final_pose`` (``finalpose``) of moved objects.
+    bbox : bool
+        ``VLMCD.ANSWER_BBOX``; a ``json`` ``describe`` prompt then also asks for the boxes.
 
     Returns
     -------
@@ -308,7 +343,21 @@ def question(task, state_encoding="time", answer_format="json", order="size", vo
         fields = '{"action": "moved", "added" or "removed", "class": the object category, '
         if volume:
             fields += '"volume_m3": its bounding-box volume in cubic metres, '
-        fields += '"distance_m": for a moved object, how far it moved in metres}.'
+        fields += '"distance_m": for a moved object, how far it moved in metres'
+        if pose != "none":
+            fields += (', "rotation_deg": for a moved object, how many degrees it turned '
+                       '(0 to 180)')
+        if pose == "finalpose":
+            fields += (', "final_pose": for a moved object, its final pose relative to its '
+                       'original pose: {"translation_m": [dx, dy, dz], the shift in metres '
+                       'along the x, y and z axes of the point cloud, "yaw_deg": the turn '
+                       'about the vertical z axis in degrees, counter-clockwise seen from above}')
+        if bbox:
+            fields += (', "bbox_before": for a moved or removed object, its axis-aligned bounding box '
+                       'before the change, {"center": [x, y, z], "size": [dx, dy, dz]} in metres in '
+                       'the coordinates of the point cloud, and "bbox_after": the same for a moved or '
+                       'added object after the change')
+        fields += '}.'
         text = ("List every object that was moved, added or removed as a JSON array "
                 "with one entry per object: " + fields)
         if order == "size" and order_in_prompt:
@@ -327,6 +376,8 @@ def question(task, state_encoding="time", answer_format="json", order="size", vo
 
 
 ORDERS = ("size", "dataset")
+NO_POSES = ("index.json has no move poses; rebuild it with `python "
+            "datasets/dataset_preparation/vlm_cd/prepare_vlm_cd.py` or set VLMCD.ANSWER_POSE none")
 NO_SIZES = ("index.json has no object sizes; rebuild it with `python vlm_cd/prepare_vlm_cd.py` "
             "(pyarrow >= 26, e.g. `sbatch vlm_cd/prepare_vlm_cd_slurm.sh`)")
 
@@ -362,7 +413,8 @@ def order_changes(changes, order="size"):
                                           change_clause(c)))
 
 
-def answer(task, changes, order="size", answer_format="json", volume=True):
+def answer(task, changes, order="size", answer_format="json", volume=True, pose="none",
+           bbox=False):
     """The target answer for a task.
 
     Parameters
@@ -377,6 +429,10 @@ def answer(task, changes, order="size", answer_format="json", volume=True):
         One of ``ANSWER_FORMATS``.
     volume : bool
         Give each ``json`` ``describe`` entry its ``volume_m3`` (``VLMCD.ANSWER_VOLUME``).
+    pose : str
+        ``VLMCD.ANSWER_POSE``, see ``change_record``.
+    bbox : bool
+        ``VLMCD.ANSWER_BBOX``, see ``change_record``.
 
     Returns
     -------
@@ -386,7 +442,7 @@ def answer(task, changes, order="size", answer_format="json", volume=True):
         raise ValueError(f"unknown VLMCD.ANSWER_FORMAT {answer_format!r}; expected one of {ANSWER_FORMATS}")
     if answer_format == "json":
         if task == "describe":
-            return _json([change_record(c, volume) for c in order_changes(changes, order)])
+            return _json([change_record(c, volume, pose, bbox) for c in order_changes(changes, order)])
         if task == "count":
             n = Counter(c["action"] for c in changes)
             return _json({PAST[a]: n[a] for a in ACTIONS})
@@ -404,8 +460,10 @@ def answer(task, changes, order="size", answer_format="json", volume=True):
 def _json_objects(text):
     """JSON objects in a model output, as dicts.
 
-    Each ``{...}`` without nesting is parsed on its own, so an array cut off by the token
-    limit, or wrapped in extra text, still yields its complete entries.
+    Each top-level ``{...}`` (nested objects such as ``final_pose`` and the boxes stay
+    inside their entry) is parsed on its own, so an array cut off by the token limit, or
+    wrapped in extra text, still yields its complete entries. Pieces of a cut-off entry
+    that parse alone (its nested objects) carry no ``action`` and are skipped by callers.
 
     Parameters
     ----------
@@ -415,15 +473,19 @@ def _json_objects(text):
     -------
     list of dict
     """
-    out = []
-    for m in re.finditer(r"\{[^{}]*\}", text):
+    out, dec, i = [], json.JSONDecoder(), 0
+    while True:
+        i = text.find("{", i)
+        if i < 0:
+            return out
         try:
-            obj = json.loads(m.group(0))
+            obj, j = dec.raw_decode(text, i)
         except ValueError:
+            i += 1
             continue
         if isinstance(obj, dict):
             out.append(obj)
-    return out
+        i = j
 
 
 def _number(obj, key):
@@ -433,6 +495,28 @@ def _number(obj, key):
     except (TypeError, ValueError):
         return None
     return v if v is None or math.isfinite(v) else None
+
+
+def _box(b):
+    """``(cx, cy, cz, dx, dy, dz)`` of a ``{"center", "size"}`` box, or None when malformed."""
+    try:
+        vals = [float(x) for x in b["center"]] + [float(x) for x in b["size"]]
+    except (TypeError, ValueError, KeyError):
+        return None
+    return tuple(vals) if len(vals) == 6 and all(math.isfinite(v) for v in vals) else None
+
+
+def _pose(obj):
+    """``(dx, dy, dz, yaw_deg)`` of ``obj["final_pose"]``, or None when missing or malformed."""
+    fp = obj.get("final_pose")
+    if not isinstance(fp, dict):
+        return None
+    t = fp.get("translation_m")
+    try:
+        vals = [float(x) for x in t] + [float(fp["yaw_deg"])]
+    except (TypeError, ValueError, KeyError):
+        return None
+    return tuple(vals) if len(vals) == 4 and all(math.isfinite(v) for v in vals) else None
 
 
 def parse_describe_entries(text):
@@ -446,9 +530,11 @@ def parse_describe_entries(text):
     Returns
     -------
     list of dict
-        ``action`` (``move`` / ``add`` / ``remove``), ``category``, and ``distance_m`` and
-        ``volume_m3`` as floats, or None when not given or not a number (``text`` answers
-        never give a volume). Entries with an unknown action are skipped.
+        ``action`` (``move`` / ``add`` / ``remove``), ``category``, and ``distance_m``,
+        ``volume_m3`` and ``rotation_deg`` as floats, or None when not given or not a number
+        (``text`` answers never give a volume), and ``pose``: ``(dx, dy, dz, yaw_deg)`` of a
+        ``final_pose``, or None, and ``bbox_before`` / ``bbox_after``: ``(cx, cy, cz, dx, dy, dz)``
+        or None. Entries with an unknown action are skipped.
     """
     out = []
     if text.lstrip().startswith(("[", "{")):
@@ -457,14 +543,18 @@ def parse_describe_entries(text):
             if action is None:
                 continue
             out.append({"action": action, "category": clean_category(str(obj.get("class") or "")),
-                        "distance_m": _number(obj, "distance_m"), "volume_m3": _number(obj, "volume_m3")})
+                        "distance_m": _number(obj, "distance_m"), "volume_m3": _number(obj, "volume_m3"),
+                        "rotation_deg": _number(obj, "rotation_deg"), "pose": _pose(obj),
+                        "bbox_before": _box(obj.get("bbox_before")),
+                        "bbox_after": _box(obj.get("bbox_after"))})
         return out
     for clause in text.lower().split(";"):
         m = re.match(r"\s*(moved|added|removed)\s+(?:the|a|an)?\s*([a-z][a-z0-9]*)", clause)
         if m:
             d = re.search(r"\bby\s+(\d+(?:\.\d*)?)\s*m\b", clause)
             out.append({"action": PRESENT[m.group(1)], "category": m.group(2),
-                        "distance_m": float(d.group(1)) if d else None, "volume_m3": None})
+                        "distance_m": float(d.group(1)) if d else None, "volume_m3": None,
+                        "rotation_deg": None, "pose": None, "bbox_before": None, "bbox_after": None})
     return out
 
 
