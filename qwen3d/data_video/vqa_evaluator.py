@@ -79,17 +79,32 @@ class VQAEvaluator(DatasetEvaluator):
             self.detection_evaluator.reset()
 
     def _save_vlmcd_predictions(self, eval_results):
-        """Write per-example predictions and the metrics to the inference folder."""
+        """Write per-example predictions and the metrics to the inference folder.
+
+        ``inference/<dataset>_predictions.json`` always holds the latest eval. During
+        training (a detectron2 event storage is active) the same file is also kept as
+        ``inference/iter_<iteration:07d>/<dataset>_predictions.json``, so the periodic
+        evals of earlier checkpoints are not overwritten; the qualitative viewer
+        (visualization/training_runs/qualitative_results) lists each as a checkpoint.
+        """
         import json
         import os
         root = getattr(self.cfg, "OUTPUT_DIR", None) if self.cfg is not None else None
         if not root:
             return
+        try:
+            from detectron2.utils.events import get_event_storage
+            iteration = int(get_event_storage().iter)
+        except (AssertionError, ImportError, AttributeError):  # eval-only: no storage
+            iteration = None
+        payload = {"metrics": eval_results, "settings": self._vlmcd_settings(),
+                   "iteration": iteration, "predictions": self.vlmcd_records}
         out_dir = os.path.join(root, "inference")
-        os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, f"{self.dataset_name}_predictions.json"), "w") as f:
-            json.dump({"metrics": eval_results, "settings": self._vlmcd_settings(),
-                       "predictions": self.vlmcd_records}, f, indent=1)
+        dirs = [out_dir] + ([os.path.join(out_dir, f"iter_{iteration:07d}")] if iteration is not None else [])
+        for d in dirs:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, f"{self.dataset_name}_predictions.json"), "w") as f:
+                json.dump(payload, f, indent=1)
 
     def _vlmcd_settings(self):
         """The answer settings the targets were built with (read back by score_vlm_cd.py)."""
@@ -97,6 +112,7 @@ class VQAEvaluator(DatasetEvaluator):
         if not vc:
             return {}
         out = {k: vc.get(k) for k in ("ANSWER_FORMAT", "ANSWER_ORDER", "ANSWER_VOLUME", "ORDER_IN_PROMPT",
+                                       "ANSWER_POSE", "ANSWER_BBOX",
                                        "STATE_ENCODING", "ONLY_VISIBLE_CHANGES", "FRAMES_PER_STATE")}
         gen = self.cfg.get("GEN_KWARGS")
         out["MAX_NEW_TOKENS"] = gen.get("max_new_tokens") if gen else None  # json_compliance_vlm_cd.py
