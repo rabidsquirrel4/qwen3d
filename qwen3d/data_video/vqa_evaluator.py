@@ -105,6 +105,24 @@ class VQAEvaluator(DatasetEvaluator):
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, f"{self.dataset_name}_predictions.json"), "w") as f:
                 json.dump(payload, f, indent=1)
+        if iteration is not None:
+            self._prune_vlmcd_evals(out_dir)
+
+    def _prune_vlmcd_evals(self, out_dir):
+        """Keep the newest ``VLMCD.KEEP_EVALS`` ``inference/iter_*`` folders (0: all)."""
+        import os
+        import re
+        import shutil
+        vc = getattr(self.cfg, "VLMCD", None)
+        keep = int(vc.get("KEEP_EVALS", 0) or 0) if vc else 0
+        if keep <= 0:
+            return
+        found = sorted((int(m.group(1)), name) for name in os.listdir(out_dir)
+                       if (m := re.match(r"^iter_(\d+)$", name)) and os.path.isdir(os.path.join(out_dir, name)))
+        for _, name in found[:-keep]:
+            path = os.path.join(out_dir, name)
+            shutil.rmtree(path, ignore_errors=True)
+            self._logger.info(f"Deleted old eval {path} (VLMCD.KEEP_EVALS {keep})")
 
     def _vlmcd_settings(self):
         """The answer settings the targets were built with (read back by score_vlm_cd.py)."""

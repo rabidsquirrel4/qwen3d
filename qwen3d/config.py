@@ -489,3 +489,6 @@ def add_maskformer2_video_config(cfg):
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming
     cfg.VLMCD.EVAL_SUBSET = 0            # evaluate on a fixed random subset of this many examples (0: all)
+    # Periodic evals kept as inference/iter_<iteration>/ during training: the newest this many
+    # (0: all). inference/<dataset>_predictions.json always holds the latest eval.
+    cfg.VLMCD.KEEP_EVALS = 0

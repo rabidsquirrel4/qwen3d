@@ -9,7 +9,9 @@ Metric groups (``describe``):
 
 - **changes**: precision / recall / F1 of ``(action, class)`` pairs, and per-action F1.
 - **distances** (``move_dist_*``): for moved objects whose true distance is given (seen in
-  both scans), paired with predicted moves of the same class.
+  both scans), paired with predicted moves of the same class. ``change_f1_within_0.1m`` /
+  ``move_f1_within_0.1m``: the change / move F1 where a paired move also needs its distance
+  within 0.1 m (as ``vlm_cd/distance_f1_vlm_cd.py`` in the parent repo).
 - **orientation** (``move_rot_*``, ``VLMCD.ANSWER_POSE`` orient / finalpose): absolute error in
   degrees of ``rotation_deg`` over moved objects, paired like distances.
 - **final pose** (``move_pose_*``, ``finalpose``): for moves with a true ``final_pose``, the
@@ -38,6 +40,7 @@ except ImportError:  # loaded by file path, with datasets/ on sys.path (score_vl
     import vlm_cd
 
 DIST_THRESHOLDS = (0.1, 0.25, 0.5)  # metres
+F1_DIST_THRESHOLDS = (0.1,)         # metres: change_f1_within_<t>m / move_f1_within_<t>m
 ROT_THRESHOLDS = (10, 30, 90)       # degrees
 VOLUME_RATIOS = (1.25, 2.0, 4.0)    # max(pred / true, true / pred)
 VOLUME_FLOOR = 1e-7                 # m^3; keeps logs finite for a 0 prediction
@@ -290,6 +293,11 @@ def volume_metrics(pairs, n_gt, n_missing):
     return out
 
 
+def _f1(tp, fp, fn):
+    """F1 from counts, 0.0 when undefined."""
+    return 2 * tp / (2 * tp + fp + fn) if tp + fp + fn else 0.0
+
+
 def describe_metrics(res, order="size"):
     """Metrics of ``describe`` predictions; see ``vlmcd_metrics``."""
     out = {}
@@ -344,6 +352,14 @@ def describe_metrics(res, order="size"):
     for a, (t, f_p, f_n) in per.items():
         out[f"{a}_f1"] = 2 * t / (2 * t + f_p + f_n) if t + f_p + f_n else 0.0
     out.update(distance_metrics(*dist))
+    if dist[1]:
+        # A paired move whose distance is off by more than t turns a true positive into a false
+        # positive and a false negative; moves without a distance keep their class-level match.
+        m_tp, m_fp, m_fn = per["move"]
+        for t in F1_DIST_THRESHOLDS:
+            far = sum(abs(p_ - g_) > t for p_, g_ in dist[0])
+            out[f"change_f1_within_{t:g}m"] = _f1(tp - far, fp + far, fn + far)
+            out[f"move_f1_within_{t:g}m"] = _f1(m_tp - far, m_fp + far, m_fn + far)
     out.update(rotation_metrics(*rot))
     out.update(pose_summary(pose_errs, pose_gt, pose_missing))
     out.update(bbox_summary(box_e, box_i, box_gt, box_missing))
@@ -418,6 +434,9 @@ def vlmcd_metrics(dataset_name, res, order="size"):
           ``abs_rel`` (mean |error| / true), ``acc_<t>m`` (share of pairs within t m),
           ``recall_0.25m`` (share of all such true moves found with an error <= 0.25 m),
           ``pairs`` and ``missing`` (paired moves predicted without a distance).
+        - ``change_f1_within_0.1m`` / ``move_f1_within_0.1m``: ``change_f1`` / ``move_f1``
+          where a paired move counts only if its distance error is <= 0.1 m (thresholds:
+          ``F1_DIST_THRESHOLDS``).
         - ``volume_*``, over true entries with a volume, paired with predicted entries of
           the same action and class: ``mae_log10`` / ``medae_log10`` / ``rmse_log10``
           (error in orders of magnitude), ``bias_log10`` (> 0 overestimates),

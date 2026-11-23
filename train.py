@@ -562,7 +562,7 @@ class Trainer(DefaultTrainer):
             ret.append(
                 hooks.PeriodicCheckpointer(
                     self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD,
-                    max_to_keep=15,
+                    max_to_keep=3,
                 )
             )
 
