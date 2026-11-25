@@ -9,11 +9,13 @@ Metric groups (``describe``):
 
 - **changes**: precision / recall / F1 of ``(action, class)`` pairs, and per-action F1.
 - **distances** (``move_dist_*``): for moved objects whose true distance is given (seen in
-  both scans), paired with predicted moves of the same class. ``change_f1_within_0.1m`` /
-  ``move_f1_within_0.1m``: the change / move F1 where a paired move also needs its distance
-  within 0.1 m (as ``vlm_cd/distance_f1_vlm_cd.py`` in the parent repo).
+  both scans), paired with predicted moves of the same class. ``move_dist_precision`` /
+  ``recall`` / ``f1_<t>m`` score only moves that come with a distance: a hit is a pair whose
+  distance error is within t; precision is over predicted moves that give a distance, recall
+  over true moves that have one (the "F1 @ t m" of the qwen3d_rgbd_dist model card).
 - **orientation** (``move_rot_*``, ``VLMCD.ANSWER_POSE`` orient / finalpose): absolute error in
-  degrees of ``rotation_deg`` over moved objects, paired like distances.
+  degrees of ``rotation_deg`` over moved objects, paired like distances, and the same
+  precision / recall / F1 at ``ROT_F1_THRESHOLDS`` degrees.
 - **final pose** (``move_pose_*``, ``finalpose``): for moves with a true ``final_pose``, the
   error of its translation (metres, Euclidean) and yaw (degrees, wrapped to 180).
 - **boxes** (``bbox_*``, ``VLMCD.ANSWER_BBOX``): per state, true boxes of the same action and class
@@ -39,9 +41,9 @@ try:
 except ImportError:  # loaded by file path, with datasets/ on sys.path (score_vlm_cd.py)
     import vlm_cd
 
-DIST_THRESHOLDS = (0.1, 0.25, 0.5)  # metres
-F1_DIST_THRESHOLDS = (0.1,)         # metres: change_f1_within_<t>m / move_f1_within_<t>m
-ROT_THRESHOLDS = (10, 30, 90)       # degrees
+DIST_THRESHOLDS = (0.1, 0.25, 0.5)  # metres: move_dist_acc_<t>m and move_dist_precision/recall/f1_<t>m
+ROT_THRESHOLDS = (10, 30, 90)       # degrees: move_rot_acc_<t>deg
+ROT_F1_THRESHOLDS = (10, 20, 30)    # degrees: move_rot_precision/recall/f1_<t>deg
 VOLUME_RATIOS = (1.25, 2.0, 4.0)    # max(pred / true, true / pred)
 VOLUME_FLOOR = 1e-7                 # m^3; keeps logs finite for a 0 prediction
 
@@ -149,34 +151,79 @@ def _truncated(text):
     return t.startswith("[") and not vlm_cd.is_json_answer(t)
 
 
-def distance_metrics(pairs, n_gt, n_missing):
-    """``move_dist_*`` keys from ``match_values(..., "distance_m", ("move",))``."""
-    if not n_gt:
+def threshold_prf(errors, n_pred, n_gt, thresholds, prefix, unit):
+    """Precision / recall / F1 of paired values whose error is within each threshold.
+
+    Only entries that carry the value are scored: a hit is a pair (``match_values``) with an
+    absolute error within the threshold, precision is hits over the predicted entries that
+    give the value, recall hits over the true entries that have it. A prediction of the
+    wrong class, or one left unpaired, counts against precision; a true value never paired
+    within the threshold counts against recall.
+
+    Parameters
+    ----------
+    errors : list of float
+        Absolute errors of the pairs.
+    n_pred, n_gt : int
+        Predicted / true entries that give the value.
+    thresholds : tuple of float
+    prefix, unit : str
+        Key ``<prefix>_f1_<t><unit>``, e.g. ``move_dist_f1_0.1m``.
+
+    Returns
+    -------
+    dict
+        ``<prefix>_precision_<t><unit>``, ``..._recall_...``, ``..._f1_...`` per threshold, and
+        ``<prefix>_pred`` / ``<prefix>_gt``; empty when neither side has a value.
+    """
+    if not n_pred and not n_gt:
         return {}
+    out = {f"{prefix}_pred": float(n_pred), f"{prefix}_gt": float(n_gt)}
+    for t in thresholds:
+        hits = sum(e <= t for e in errors)
+        out[f"{prefix}_precision_{t}{unit}"] = hits / n_pred if n_pred else 0.0
+        out[f"{prefix}_recall_{t}{unit}"] = hits / n_gt if n_gt else 0.0
+        out[f"{prefix}_f1_{t}{unit}"] = 2 * hits / (n_pred + n_gt)
+    return out
+
+
+def distance_metrics(pairs, n_gt, n_missing, n_pred=0):
+    """``move_dist_*`` keys from ``match_values(..., "distance_m", ("move",))``.
+
+    ``n_pred``: predicted moves that give a distance (any class), the precision denominator
+    of ``threshold_prf``.
+    """
+    out = threshold_prf([abs(p - g) for p, g in pairs], n_pred, n_gt, DIST_THRESHOLDS, "move_dist", "m")
+    if not n_gt:
+        return out
     err = np.array([p - g for p, g in pairs]) if pairs else np.array([np.nan])
     ae = np.abs(err)
-    out = {
+    out.update({
         "move_dist_mae_m": float(np.mean(ae)),
         "move_dist_medae_m": float(np.median(ae)),
         "move_dist_rmse_m": float(np.sqrt(np.mean(err ** 2))),
         "move_dist_bias_m": float(np.mean(err)),
         "move_dist_abs_rel": float(np.mean([abs(p - g) / g for p, g in pairs if g > 0]))
         if any(g > 0 for _, g in pairs) else float("nan"),
-    }
+    })
     for t in DIST_THRESHOLDS:
         out[f"move_dist_acc_{t}m"] = float(np.mean(ae <= t)) if pairs else 0.0
-    out["move_dist_recall_0.25m"] = float(np.sum(ae <= 0.25)) / n_gt if pairs else 0.0
+    # (move_dist_recall_<t>m from threshold_prf: pairs within t over all true moves with a distance)
     out["move_dist_pairs"] = float(len(pairs))
     out["move_dist_missing"] = float(n_missing)
     return out
 
 
-def rotation_metrics(pairs, n_gt, n_missing):
-    """``move_rot_*`` keys from ``match_values(..., "rotation_deg", ("move",))``."""
+def rotation_metrics(pairs, n_gt, n_missing, n_pred=0):
+    """``move_rot_*`` keys from ``match_values(..., "rotation_deg", ("move",))``.
+
+    ``n_pred``: predicted moves that give a ``rotation_deg`` (any class).
+    """
+    out = threshold_prf([abs(p - g) for p, g in pairs], n_pred, n_gt, ROT_F1_THRESHOLDS, "move_rot", "deg")
     if not n_gt:
-        return {}
+        return out
     ae = np.abs([p - g for p, g in pairs]) if pairs else np.array([np.nan])
-    out = {"move_rot_mae_deg": float(np.mean(ae)), "move_rot_medae_deg": float(np.median(ae))}
+    out.update({"move_rot_mae_deg": float(np.mean(ae)), "move_rot_medae_deg": float(np.median(ae))})
     for t in ROT_THRESHOLDS:
         out[f"move_rot_acc_{t}deg"] = float(np.mean(ae <= t)) if pairs else 0.0
     out["move_rot_pairs"] = float(len(pairs))
@@ -293,17 +340,13 @@ def volume_metrics(pairs, n_gt, n_missing):
     return out
 
 
-def _f1(tp, fp, fn):
-    """F1 from counts, 0.0 when undefined."""
-    return 2 * tp / (2 * tp + fp + fn) if tp + fp + fn else 0.0
-
-
 def describe_metrics(res, order="size"):
     """Metrics of ``describe`` predictions; see ``vlmcd_metrics``."""
     out = {}
     tp = fp = fn = 0
     per = {a: [0, 0, 0] for a in vlm_cd.ACTIONS}
     dist, vol, rot = ([], 0, 0), ([], 0, 0), ([], 0, 0)
+    n_pred_dist = n_pred_rot = 0   # predicted moves that give a distance / a rotation_deg
     pose_errs, pose_gt, pose_missing = [], 0, 0
     box_e, box_i, box_gt, box_missing = [], [], 0, 0
     n_json = n_trunc = 0
@@ -325,6 +368,8 @@ def describe_metrics(res, order="size"):
         vol = (vol[0] + v[0], vol[1] + v[1], vol[2] + v[2])
         r = match_values(pr, gr, "rotation_deg", actions=("move",))
         rot = (rot[0] + r[0], rot[1] + r[1], rot[2] + r[2])
+        n_pred_dist += sum(e["action"] == "move" and e["distance_m"] is not None for e in pr)
+        n_pred_rot += sum(e["action"] == "move" and e["rotation_deg"] is not None for e in pr)
         pe, pg, pm = pose_metrics(pr, gr)
         pose_errs, pose_gt, pose_missing = pose_errs + pe, pose_gt + pg, pose_missing + pm
         be, bi, bg, bm = bbox_pairs(pr, gr)
@@ -351,16 +396,8 @@ def describe_metrics(res, order="size"):
                change_f1=2 * prec * rec / (prec + rec) if prec + rec else 0.0)
     for a, (t, f_p, f_n) in per.items():
         out[f"{a}_f1"] = 2 * t / (2 * t + f_p + f_n) if t + f_p + f_n else 0.0
-    out.update(distance_metrics(*dist))
-    if dist[1]:
-        # A paired move whose distance is off by more than t turns a true positive into a false
-        # positive and a false negative; moves without a distance keep their class-level match.
-        m_tp, m_fp, m_fn = per["move"]
-        for t in F1_DIST_THRESHOLDS:
-            far = sum(abs(p_ - g_) > t for p_, g_ in dist[0])
-            out[f"change_f1_within_{t:g}m"] = _f1(tp - far, fp + far, fn + far)
-            out[f"move_f1_within_{t:g}m"] = _f1(m_tp - far, m_fp + far, m_fn + far)
-    out.update(rotation_metrics(*rot))
+    out.update(distance_metrics(*dist, n_pred=n_pred_dist))
+    out.update(rotation_metrics(*rot, n_pred=n_pred_rot))
     out.update(pose_summary(pose_errs, pose_gt, pose_missing))
     out.update(bbox_summary(box_e, box_i, box_gt, box_missing))
     out.update(volume_metrics(*vol))
@@ -432,11 +469,15 @@ def vlmcd_metrics(dataset_name, res, order="size"):
           a predicted move of the class (``match_values``): ``mae_m``, ``medae_m``,
           ``rmse_m``, ``bias_m`` (mean predicted minus true: > 0 overestimates),
           ``abs_rel`` (mean |error| / true), ``acc_<t>m`` (share of pairs within t m),
-          ``recall_0.25m`` (share of all such true moves found with an error <= 0.25 m),
           ``pairs`` and ``missing`` (paired moves predicted without a distance).
-        - ``change_f1_within_0.1m`` / ``move_f1_within_0.1m``: ``change_f1`` / ``move_f1``
-          where a paired move counts only if its distance error is <= 0.1 m (thresholds:
-          ``F1_DIST_THRESHOLDS``).
+        - ``move_dist_precision_<t>m`` / ``recall_<t>m`` / ``f1_<t>m`` (t in
+          ``DIST_THRESHOLDS``): only moves that come with a distance are scored; a hit is a
+          pair with an error <= t, precision is over the ``move_dist_pred`` predicted moves
+          that give a distance, recall over the ``move_dist_gt`` true moves that have one
+          (``threshold_prf``).
+        - ``move_rot_*`` (``VLMCD.ANSWER_POSE`` orient / finalpose): ``mae_deg``, ``medae_deg``,
+          ``acc_<t>deg`` (``ROT_THRESHOLDS``), and ``precision`` / ``recall`` / ``f1_<t>deg``
+          (``ROT_F1_THRESHOLDS``) over moves that come with a ``rotation_deg``, as for distances.
         - ``volume_*``, over true entries with a volume, paired with predicted entries of
           the same action and class: ``mae_log10`` / ``medae_log10`` / ``rmse_log10``
           (error in orders of magnitude), ``bias_log10`` (> 0 overestimates),
