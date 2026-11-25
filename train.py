@@ -662,6 +662,9 @@ class Trainer(DefaultTrainer):
                 memo.add(value)
 
                 hyperparams = copy.copy(defaults)
+                if "voxel_point_encoder" in module_name:
+                    # New, randomly initialised module: train it faster than the LoRA adapters.
+                    hyperparams["lr"] = hyperparams["lr"] * cfg.VOXEL_POINT_ENCODER.LR_MULTIPLIER
                 if "backbone" in module_name:
                     # panet layers are initialize from scratch so use default lr
                     panet_found = False

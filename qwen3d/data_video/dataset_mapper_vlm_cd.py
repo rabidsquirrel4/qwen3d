@@ -31,6 +31,7 @@ import logging
 import os
 import random
 import time
+import zlib
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -117,6 +118,233 @@ def visible_changes(changes, visibility, before_ids, after_ids, min_pixels):
     return out
 
 
+def sample_view_ids(changes, num_frames, k, rng, change_prob):
+    """Choose ``k`` camera views for the after scan in map -> single-view mode.
+
+    Parameters
+    ----------
+    changes : list of dict
+        Index change records with ``visible_before_frames`` / ``visible_after_frames``.
+    num_frames : int
+    k : int
+    rng : random.Random
+    change_prob : float
+        Probability of drawing from the frames that show some change (an object's old or
+        new place), rather than from all frames.
+
+    Returns
+    -------
+    list of int
+        Sorted, distinct frame indices.
+    """
+    if changes and "visible_before_frames" not in changes[0]:
+        raise KeyError("index.json has no visible frame lists; rebuild it with "
+                       "`python vlm_cd/prepare_vlm_cd.py` (VLMCD.AFTER_FRAMES needs them)")
+    k = min(k, num_frames)
+    showing = sorted({f for c in changes
+                      for f in (c.get("visible_before_frames") or []) + (c.get("visible_after_frames") or [])
+                      if 0 <= f < num_frames})
+    pool = showing if showing and rng.random() < change_prob else list(range(num_frames))
+    ids = rng.sample(pool, min(k, len(pool)))
+    rest = [f for f in range(num_frames) if f not in ids]
+    ids += rng.sample(rest, k - len(ids))
+    return sorted(ids)
+
+
+def visible_changes_from_view(changes, visibility, map_ids, view_ids, min_pixels):
+    """Changes that a few after-scan views reveal, given a map of the before scan.
+
+    Both scans follow the same camera path, so ``pixels_before`` of a view frame says
+    whether the view looks at an object's old place. A change counts when:
+
+    - removed: its old place is in the map and in view (it should be seen, and is not);
+    - added: it is in view;
+    - moved: it is in the map, and its old or its new place is in view. A move whose new
+      place is out of view looks like a removal from this view; it keeps its true label.
+
+    ``seen_before`` (in the map) and ``seen_after`` (new place in view) are added, so a
+    moved object's distance is only asked for when both ends were observed.
+
+    Parameters
+    ----------
+    changes : list of dict
+    visibility : dict of int to list of dict
+        ``change_visibility`` per frame index; must hold ``map_ids`` and ``view_ids``.
+    map_ids : list of int or None
+        Frames of the before scan that make the map; None when the map is the whole
+        before point cloud (every object that existed before is in it).
+    view_ids : list of int
+    min_pixels : int
+
+    Returns
+    -------
+    list of dict
+        Copies of the revealed changes, in order.
+    """
+    def seen(ids, key):
+        return {v["object"] for i in ids for v in visibility.get(i) or []
+                if (v.get(key) or 0) >= min_pixels}
+
+    if map_ids is None:
+        in_map = {c["object"] for c in changes if c["action"] != "add"}
+    else:
+        in_map = seen(map_ids, "pixels_before")
+    old_in_view, new_in_view = seen(view_ids, "pixels_before"), seen(view_ids, "pixels_after")
+    out = []
+    for c in changes:
+        o, a = c["object"], c["action"]
+        if ((a == "remove" and o in in_map and o in old_in_view)
+                or (a == "add" and o in new_in_view)
+                or (a == "move" and o in in_map and (o in old_in_view or o in new_in_view))):
+            out.append({**c, "seen_before": o in in_map, "seen_after": o in new_in_view})
+    return out
+
+
+_KEY_OFFSET, _KEY_RANGE = 1 << 20, 1 << 21
+
+
+def voxel_cell_keys(xyz, voxel_size):
+    """Integer key of the voxel cell holding each point, as Qwen-3D voxelizes.
+
+    ``backproject.voxelization`` puts a point in cell ``round(xyz / voxel_size)``; the key
+    packs the three cell indices into one int64. ``VoxelPointEncoder.cell_keys`` is the
+    torch twin.
+
+    Parameters
+    ----------
+    xyz : numpy.ndarray
+        ``(N, 3)``.
+    voxel_size : float
+
+    Returns
+    -------
+    numpy.ndarray
+        int64 ``(N,)``.
+    """
+    c = np.round(xyz.astype(np.float32) / np.float32(voxel_size)).astype(np.int64) + _KEY_OFFSET
+    return (c[:, 0] * _KEY_RANGE + c[:, 1]) * _KEY_RANGE + c[:, 2]
+
+
+def points_in_cells(xyz, rgb, cells, voxel_size, per_cell, rng):
+    """At most ``per_cell`` random points of each occupied voxel cell.
+
+    Parameters
+    ----------
+    xyz : numpy.ndarray
+        float32 ``(N, 3)``.
+    rgb : numpy.ndarray
+        uint8 ``(N, 3)``.
+    cells : numpy.ndarray
+        int64 keys of the occupied cells.
+    voxel_size : float
+    per_cell : int
+    rng : numpy.random.Generator
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        The kept ``xyz`` and ``rgb``.
+    """
+    lo = (np.round(np.stack([(cells // _KEY_RANGE ** 2), (cells // _KEY_RANGE) % _KEY_RANGE,
+                             cells % _KEY_RANGE], 1) - _KEY_OFFSET) - 1) * voxel_size
+    hi = lo.max(0) + 2 * voxel_size
+    lo = lo.min(0)
+    box = np.flatnonzero(((xyz >= lo) & (xyz <= hi)).all(1))  # cheap pre-filter
+    keys = voxel_cell_keys(xyz[box], voxel_size)
+    hit = np.isin(keys, cells)
+    idx, keys = box[hit], keys[hit]
+    perm = rng.permutation(len(idx))
+    idx, keys = idx[perm], keys[perm]
+    order = np.argsort(keys, kind="stable")
+    keys = keys[order]
+    starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
+    rank = np.arange(len(keys)) - np.repeat(starts, np.diff(np.r_[starts, len(keys)]))
+    keep = idx[order[rank < per_cell]]
+    return xyz[keep], rgb[keep]
+
+
+def map_voxels(xyz, rgb, voxel_size, max_tokens, per_voxel, rng):
+    """Voxelize the map point cloud into tokens for ``VoxelPointEncoder.map_tokens``.
+
+    Parameters
+    ----------
+    xyz : numpy.ndarray
+        float32 ``(N, 3)`` metres.
+    rgb : numpy.ndarray
+        uint8 ``(N, 3)``.
+    voxel_size : float
+        Cells are ``round(xyz / voxel_size)``.
+    max_tokens : int
+        Random subset of the voxels beyond this many.
+    per_voxel : int
+        Random subset of each voxel's points.
+    rng : numpy.random.Generator
+
+    Returns
+    -------
+    dict
+        ``map_voxel_xyz`` float32 ``(M, 3)`` (mean of all the voxel's points),
+        ``map_voxel_count`` float32 ``(M,)`` (its points before subsampling),
+        ``map_points_xyz`` float32 ``(P, 3)``, ``map_points_rgb`` uint8 ``(P, 3)``,
+        ``map_points_voxel`` int64 ``(P,)`` and ``map_voxel_size``.
+    """
+    keys = voxel_cell_keys(xyz, voxel_size)
+    uniq, inv, count = np.unique(keys, return_inverse=True, return_counts=True)
+    m = len(uniq)
+    centre = np.stack([np.bincount(inv, weights=xyz[:, j], minlength=m) for j in range(3)], 1) / count[:, None]
+    keep_vox = np.arange(m)
+    if m > max_tokens:
+        keep_vox = np.sort(rng.choice(m, max_tokens, replace=False))
+    new_id = np.full(m, -1, np.int64)
+    new_id[keep_vox] = np.arange(len(keep_vox))
+    pts = np.flatnonzero(new_id[inv] >= 0)
+    pts = pts[rng.permutation(len(pts))]
+    vid = new_id[inv[pts]]
+    order = np.argsort(vid, kind="stable")
+    pts, vid = pts[order], vid[order]
+    starts = np.flatnonzero(np.r_[True, vid[1:] != vid[:-1]])
+    rank = np.arange(len(vid)) - np.repeat(starts, np.diff(np.r_[starts, len(vid)]))
+    sel = rank < per_voxel
+    pts, vid = pts[sel], vid[sel]
+    return {
+        "map_voxel_xyz": torch.from_numpy(centre[keep_vox].astype(np.float32)),
+        "map_voxel_count": torch.from_numpy(count[keep_vox].astype(np.float32)),
+        "map_points_xyz": torch.from_numpy(np.ascontiguousarray(xyz[pts], dtype=np.float32)),
+        "map_points_rgb": torch.from_numpy(np.ascontiguousarray(rgb[pts], dtype=np.uint8)),
+        "map_points_voxel": torch.from_numpy(vid.astype(np.int64)),
+        "map_voxel_size": float(voxel_size),
+    }
+
+
+def check_flags(cfg):
+    """Reject pathway flag combinations that no run supports.
+
+    The launchers in ``train_utils/`` pin one combination each (``README.md``, "Reproducing and
+    validating runs"): RGB-D runs use ``AFTER_FRAMES 0``, ``MAP_SOURCE frames`` and no voxel point
+    encoder; ``qwen3d_points_dist`` uses ``AFTER_FRAMES 1``, ``MAP_SOURCE points`` and the encoder.
+
+    Parameters
+    ----------
+    cfg : detectron2.config.CfgNode
+
+    Raises
+    ------
+    ValueError
+        On an unknown ``MAP_SOURCE`` or an unsupported combination.
+    """
+    vc = cfg.VLMCD
+    single_view = int(vc.AFTER_FRAMES) > 0
+    if vc.MAP_SOURCE not in ("frames", "points"):
+        raise ValueError(f"unknown VLMCD.MAP_SOURCE {vc.MAP_SOURCE!r}; expected frames or points")
+    if vc.MAP_SOURCE == "points" and not (single_view and cfg.VOXEL_POINT_ENCODER.ENABLED):
+        raise ValueError("VLMCD.MAP_SOURCE points needs VLMCD.AFTER_FRAMES > 0 and VOXEL_POINT_ENCODER.ENABLED")
+    if single_view and vc.STATE_ENCODING != "time":
+        raise ValueError("VLMCD.AFTER_FRAMES > 0 needs VLMCD.STATE_ENCODING time")
+    if single_view and (vc.ANSWER_POSE != "none" or vc.ANSWER_BBOX):
+        raise ValueError("VLMCD.AFTER_FRAMES > 0 with ANSWER_POSE / ANSWER_BBOX is untested; "
+                         "use ANSWER_POSE none and ANSWER_BBOX False (or relax check_flags)")
+
+
 class VlmCdDatasetMapper:
     """Map ``vlmcd_<task>_<split>`` dataset dicts to Qwen-3D samples.
 
@@ -140,6 +368,11 @@ class VlmCdDatasetMapper:
         self.examples = self.index["examples"]
         self._fs = None
         self._fs_pid = None
+        check_flags(cfg)
+        # Pathway switches (see check_flags): one view vs the map (qwen3d_points_dist), and a map
+        # from the raw before point cloud instead of RGB-D frames.
+        self.single_view = int(self.vc.AFTER_FRAMES) > 0
+        self.points_map = self.vc.MAP_SOURCE == "points"
 
         from transformers import AutoProcessor
         self._qwen_image_processor = AutoProcessor.from_pretrained(
@@ -237,6 +470,11 @@ class VlmCdDatasetMapper:
         out = {"visibility": {f: vis_col[row[f]] for f in set(before_ids) | set(after_ids)}}
         for state, ids in (("before", before_ids), ("after", after_ids)):
             rows = [row[i] for i in ids]
+            if not rows:  # VLMCD.MAP_SOURCE points: no before frames
+                out[f"rgb_{state}"] = np.zeros((0, h, w, 3), np.uint8)
+                out[f"depth_{state}"] = np.zeros((0, h, w), np.uint16)
+                out[f"c2w_{state}"] = np.zeros((0, 4, 4), np.float32)
+                continue
             rgb_col, depth_col = table[f"rgb_{state}"], table[f"depth_{state}"]
             out[f"rgb_{state}"] = np.stack([
                 np.frombuffer(rgb_col[r].as_py(), np.uint8).reshape(h, w, 3) for r in rows])
@@ -250,6 +488,111 @@ class VlmCdDatasetMapper:
                      visibility=np.array(out["visibility"], dtype=object))
             os.replace(tmp, cache)
         return out
+
+    def read_map_points(self, example_id, rec):
+        """The dataset's point cloud of the before scan (the map), with colours.
+
+        Parameters
+        ----------
+        example_id : str
+        rec : dict
+            Index record with ``points`` (``path``, ``row_group``).
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            float32 ``(N, 3)`` metres and uint8 ``(N, 3)``.
+        """
+        loc = rec.get("points")
+        if loc is None:
+            raise KeyError("index.json has no point cloud locations; rebuild it with "
+                           "`python vlm_cd/prepare_vlm_cd.py` (VOXEL_POINT_ENCODER needs them)")
+        cols = ["example_id", "pc_origin", "pc_scale", "static_xyz_q", "moved_before_xyz_q",
+                "static_rgb", "moved_before_rgb"]
+        last = None
+        for attempt in range(self.vc.RETRIES):
+            try:
+                if self.vc.LOCAL_DIR:
+                    path = os.path.join(self.vc.LOCAL_DIR, "data", loc["path"].split("/data/", 1)[1])
+                    f = open(path, "rb")
+                else:
+                    f = self.fs().open(loc["path"], block_size=8 * 2**20)
+                with f:
+                    t = pq.ParquetFile(f).read_row_group(loc["row_group"], columns=cols)
+                break
+            except Exception as e:
+                last = e
+                wait = 2 ** attempt + random.random()
+                logger.warning(f"vlmcd: reading points of {example_id} failed ({e!r}); retry in {wait:.1f} s")
+                self._fs = None
+                time.sleep(wait)
+        else:
+            raise RuntimeError(f"vlmcd: could not read points of {example_id}") from last
+        if t["example_id"][0].as_py() != example_id:
+            raise KeyError(f"{example_id} is not in {loc}")
+        origin = np.asarray(t["pc_origin"][0].as_py(), np.float32)
+        scale = np.float32(t["pc_scale"][0].as_py())
+
+        def flat(c, dtype):
+            return t[c].combine_chunks().flatten().flatten().to_numpy(zero_copy_only=False).astype(dtype).reshape(-1, 3)
+
+        xyz = np.vstack([flat("static_xyz_q", np.float32), flat("moved_before_xyz_q", np.float32)]) / scale + origin
+        rgb = np.vstack([flat("static_rgb", np.uint8), flat("moved_before_rgb", np.uint8)])
+        return xyz, rgb
+
+    def voxel_points(self, map_points, multi_scale_xyz, original_xyz, depths, images, n_before, rng):
+        """Raw points for ``VoxelPointEncoder``, in the coordinates Qwen-3D voxelizes.
+
+        The before voxels get the dataset's before point cloud; the after voxels get the
+        full-resolution back-projection of the after frames' depth, so both carry geometry
+        finer than the image features. Only points in occupied voxel cells are kept, at most
+        ``POINTS_PER_VOXEL`` per cell. The after points keep the ``AFTER_OFFSET`` shift of
+        the after cameras, so they fall in the after scan's voxels.
+
+        Parameters
+        ----------
+        map_points : callable
+            Returns the map cloud ``(xyz, rgb)`` (``read_map_points``); called only when
+            there are before views.
+        multi_scale_xyz : list of torch.Tensor
+            From ``get_multiview_xyz``; index 1 is the grid that Qwen-3D voxelizes.
+        original_xyz : torch.Tensor
+            ``(V, H, W, 3)`` full-resolution back-projection (after views shifted).
+        depths : list of torch.Tensor
+            ``(H, W)`` metres; 0 where invalid.
+        images : list of torch.Tensor
+            uint8 ``(3, H, W)``.
+        n_before : int
+            Views of the before scan (they come first).
+        rng : numpy.random.Generator
+
+        Returns
+        -------
+        dict
+            ``voxel_points_xyz`` float32 ``(P, 3)`` and ``voxel_points_rgb`` uint8 ``(P, 3)``.
+        """
+        vs = float(self.cfg.INPUT.VOXEL_SIZE[::-1][1])
+        k = int(self.cfg.VOXEL_POINT_ENCODER.POINTS_PER_VOXEL)
+        grid = multi_scale_xyz[1].reshape(len(images), -1, 3).numpy()
+        out_xyz, out_rgb = [], []
+        # Before: the map cloud, in the before voxels' cells.
+        if n_before:
+            cells = np.unique(voxel_cell_keys(grid[:n_before].reshape(-1, 3), vs))
+            xyz, rgb = points_in_cells(*map_points(), cells, vs, k, rng)
+            out_xyz.append(xyz)
+            out_rgb.append(rgb)
+        # After: the after views' own depth, at full resolution.
+        if len(images) > n_before:
+            cells = np.unique(voxel_cell_keys(grid[n_before:].reshape(-1, 3), vs))
+            full = original_xyz[n_before:].reshape(-1, 3).numpy()
+            valid = torch.stack(depths[n_before:]).reshape(-1).numpy() > 0
+            col = torch.stack(images[n_before:]).permute(0, 2, 3, 1).reshape(-1, 3).numpy()
+            assert full.shape[0] == valid.shape[0] == col.shape[0], (full.shape, valid.shape, col.shape)
+            xyz, rgb = points_in_cells(full[valid], col[valid], cells, vs, k, rng)
+            out_xyz.append(xyz)
+            out_rgb.append(rgb)
+        return {"voxel_points_xyz": torch.from_numpy(np.ascontiguousarray(np.vstack(out_xyz), dtype=np.float32)),
+                "voxel_points_rgb": torch.from_numpy(np.ascontiguousarray(np.vstack(out_rgb), dtype=np.uint8))}
 
     # ---------------------------------------------------------------- geometry
     def intrinsics(self, rec, scale):
@@ -301,6 +644,68 @@ class VlmCdDatasetMapper:
         return rgb, depth
 
     # -------------------------------------------------------------------- call
+    # ------------------------------------------------------------------ pathways
+    def select_frame_ids(self, rec, example_id, rng):
+        """Before / after frame ids for one example, by pathway.
+
+        ``AFTER_FRAMES 0`` and ``MAP_SOURCE frames`` (every RGB-D run: rgbd_dist, orient,
+        finalpose) draw ``FRAMES_PER_STATE`` frames per state from ``rng`` exactly as before the
+        point-cloud merge. ``AFTER_FRAMES > 0`` (points_dist) draws that many after views,
+        seeded by the example id in evaluation; ``MAP_SOURCE points`` uses no before frames.
+
+        Parameters
+        ----------
+        rec : dict
+            The example's index record.
+        example_id : str
+        rng : random.Random
+
+        Returns
+        -------
+        tuple of list of int
+            ``(before_ids, after_ids)``.
+        """
+        n = rec["num_frames"]
+        k = int(self.vc.FRAMES_PER_STATE)
+        before_ids = [] if self.points_map else sample_frame_ids(n, k, self.is_train, rng)
+        if self.single_view:
+            # Evaluation: a fixed view per example (seeded by its id), varying across examples.
+            view_rng = rng if self.is_train else random.Random(zlib.crc32(example_id.encode()))
+            after_ids = sample_view_ids(rec["changes"], n, int(self.vc.AFTER_FRAMES), view_rng,
+                                        float(self.vc.VIEW_CHANGE_PROB))
+        elif self.vc.SAME_FRAMES:
+            after_ids = before_ids
+        else:
+            after_ids = sample_frame_ids(n, k, self.is_train, rng)
+        return before_ids, after_ids
+
+    def select_changes(self, changes, visibility, before_ids, after_ids):
+        """The changes the target lists, by pathway.
+
+        Parameters
+        ----------
+        changes : list of dict
+            The example's change records.
+        visibility : dict
+            ``load_frames``'s per-frame visibility.
+        before_ids, after_ids : list of int
+            From ``select_frame_ids``.
+
+        Returns
+        -------
+        list of dict
+            ``visible_changes_from_view`` with ``AFTER_FRAMES > 0``; otherwise
+            ``visible_changes`` with ``ONLY_VISIBLE_CHANGES``, else all changes.
+        """
+        if self.single_view:
+            return visible_changes_from_view(changes, visibility,
+                                             None if self.points_map else before_ids, after_ids,
+                                             self.vc.MIN_VISIBLE_PIXELS)
+        if self.vc.ONLY_VISIBLE_CHANGES:
+            return visible_changes(changes, visibility, before_ids, after_ids,
+                                   self.vc.MIN_VISIBLE_PIXELS)
+        return changes
+
     def __call__(self, dataset_dict):
         """Build one sample.
 
@@ -317,11 +722,9 @@ class VlmCdDatasetMapper:
         """
         example_id = dataset_dict["example_id"]
         rec = self.examples[example_id]
-        n = rec["num_frames"]
-        k = int(self.vc.FRAMES_PER_STATE)
         rng = random.Random() if self.is_train else random.Random(0)
-        before_ids = sample_frame_ids(n, k, self.is_train, rng)
-        after_ids = before_ids if self.vc.SAME_FRAMES else sample_frame_ids(n, k, self.is_train, rng)
+        single_view, points_map = self.single_view, self.points_map
+        before_ids, after_ids = self.select_frame_ids(rec, example_id, rng)
 
         try:
             fr = self.load_frames(example_id, rec, before_ids, after_ids)
@@ -331,13 +734,10 @@ class VlmCdDatasetMapper:
                 return None
             raise
 
-        changes = rec["changes"]
-        if self.vc.ONLY_VISIBLE_CHANGES:
-            changes = visible_changes(changes, fr["visibility"], before_ids, after_ids,
-                                      self.vc.MIN_VISIBLE_PIXELS)
+        changes = self.select_changes(rec["changes"], fr["visibility"], before_ids, after_ids)
         prompt = question(self.task, self.vc.STATE_ENCODING, self.vc.ANSWER_FORMAT,
                           self.vc.ANSWER_ORDER, self.vc.ANSWER_VOLUME, self.vc.ORDER_IN_PROMPT,
-                          self.vc.ANSWER_POSE, self.vc.ANSWER_BBOX)
+                          self.vc.ANSWER_POSE, self.vc.ANSWER_BBOX, single_view=single_view)
         target = answer(self.task, changes, self.vc.ANSWER_ORDER, self.vc.ANSWER_FORMAT,
                         self.vc.ANSWER_VOLUME, self.vc.ANSWER_POSE, self.vc.ANSWER_BBOX)
 
@@ -384,6 +784,29 @@ class VlmCdDatasetMapper:
             max_pixel=self.cfg.INPUT.MAX_PIXEL,
         )
         pv_list, grid_list = qwen_preprocess_frames(self._qwen_image_processor, images)
+
+        point_info = {}
+        if self.cfg.VOXEL_POINT_ENCODER.ENABLED:
+            np_rng = np.random.default_rng(None if self.is_train else zlib.crc32(example_id.encode()))
+            cloud = []
+
+            def map_points():
+                if not cloud:
+                    cloud.extend(self.read_map_points(example_id, rec))
+                return cloud
+
+            try:
+                point_info = self.voxel_points(map_points, multi_scale_xyz, original_xyz, depths,
+                                               images, len(before_ids), np_rng)
+                if points_map:
+                    point_info.update(map_voxels(*map_points(), float(self.vc.MAP_VOXEL_SIZE),
+                                                 int(self.vc.MAP_MAX_TOKENS),
+                                                 int(self.vc.MAP_POINTS_PER_VOXEL), np_rng))
+            except Exception:
+                if self.is_train:
+                    logger.exception(f"vlmcd: skipping {example_id} (points)")
+                    return None
+                raise
 
         # STATE_ENCODING time: tell the model which views belong to which scan and how far
         # each scan was shifted, so it can pool them apart, undo the shift and give each
@@ -450,4 +873,5 @@ class VlmCdDatasetMapper:
             "use_ghost": False,
             "pseudo_2d_aug": False,
             **state_info,
+            **point_info,
         }
