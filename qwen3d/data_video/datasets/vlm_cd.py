@@ -289,10 +289,13 @@ def _json(obj):
 
 
 STATE_ENCODINGS = ("time", "offset")
+INPUT_MODES = ("3d", "2d")
 
 
-def question(task, state_encoding="time", answer_format="json", order="size", volume=True,
-             order_in_prompt=True, pose="none", bbox=False, *, single_view=False):
+def question(task, state_encoding="time", answer_format="json", 
+             input_mode="3d", n_frames=None, same_views=True, 
+             order="size", volume=True, order_in_prompt=True, 
+             pose="none", bbox=False, *, single_view=False):
     """The prompt for a task.
 
     How the two scans reach the model depends on ``VLMCD.STATE_ENCODING`` (see
@@ -312,6 +315,15 @@ def question(task, state_encoding="time", answer_format="json", order="size", vo
         One of ``STATE_ENCODINGS``.
     answer_format : str
         One of ``ANSWER_FORMATS``.
+    input_mode : str
+        One of ``INPUT_MODES``. With ``2d`` the scans are the frames themselves, as images
+        (the model's prompt labels them before 1..n and after 1..n), and ``state_encoding``
+        does not apply.
+    n_frames : int, optional
+        Frames per state, named in the ``2d`` intro.
+    same_views : bool
+        ``2d``: both states use the same camera poses (``VLMCD.SAME_FRAMES``), which the
+        intro then says.
     order : str
         ``VLMCD.ANSWER_ORDER``; with ``size`` a ``json`` ``describe`` prompt states the order.
     volume : bool
@@ -340,6 +352,17 @@ def question(task, state_encoding="time", answer_format="json", order="size", vo
             raise ValueError("VLMCD.AFTER_FRAMES needs VLMCD.STATE_ENCODING time")
         intro = ("The first point cloud is a map of a room; the second is what a camera sees in "
                  "the same room now, after some objects changed. Compare the view with the map. ")
+    if input_mode not in INPUT_MODES:
+        raise ValueError(f"unknown VLMCD.INPUT_MODE {input_mode!r}; expected one of {INPUT_MODES}")
+    if input_mode == "2d":
+        n = f"{n_frames} " if n_frames else ""
+        if same_views:
+            intro = (f"The images show the same room filmed twice along the same camera path: {n}frames "
+                     "before and the same views after some objects changed; after frame k is taken "
+                     "from the same camera pose as before frame k. ")
+        else:
+            intro = (f"The images show the same room filmed twice: {n}frames before and {n}frames "
+                     "after some objects changed. ")
     elif state_encoding == "time":
         intro = ("The two point clouds show the same room scanned twice: the first before "
                  "and the second after some objects changed. ")
@@ -422,8 +445,8 @@ def order_changes(changes, order="size"):
                                           change_clause(c)))
 
 
-def answer(task, changes, order="size", answer_format="json", volume=True, pose="none",
-           bbox=False):
+def answer(task, changes, order="size", answer_format="json", volume=True,
+           pose="none", bbox=False):
     """The target answer for a task.
 
     Parameters

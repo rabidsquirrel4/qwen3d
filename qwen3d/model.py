@@ -1330,6 +1330,13 @@ class Qwen3D(nn.Module):
                     template = template.replace(block, block * len(batched_inputs[i]["state_shift"]))
             else:
                 template = TEXT_INPUT_TRAIN_2D if self.training else TEXT_INPUT_GEN_2D
+                # should only run for 2d Qwen2.5 ablation:
+                if batched_inputs[i].get("image_labels") is not None:
+                    # Several images (vlmcd 2D baseline): one labelled block per image, so
+                    # Qwen2.5-VL's M-RoPE gives each its own (t, h, w) grid.
+                    block = "<|vision_start|><|image_pad|><|vision_end|>"
+                    template = template.replace(block, "".join(
+                        f"{label}{block}\n" for label in batched_inputs[i]["image_labels"]))
 
             if self.training:
                 text_input.append(
@@ -1368,6 +1375,14 @@ class Qwen3D(nn.Module):
                 block_sizes = torch.bincount(voxel_state[0], minlength=n_blocks).tolist()
                 assert len(block_sizes) == n_blocks and min(block_sizes) > 0, (
                     f"every scan needs voxels; got {block_sizes}"
+                )
+            # should only run for 2d Qwen2.5 ablation:
+            elif not decoder_3d and batched_inputs[0].get("image_labels") is not None:
+                merge = self.qwen_model.config.vision_config.spatial_merge_size
+                block_sizes = (image_grid_thw.prod(dim=-1) // (merge * merge)).tolist()
+                n_blocks = len(block_sizes)
+                assert sum(block_sizes) == featurecloud[0].shape[0], (
+                    f"{sum(block_sizes)} image tokens expected, got {featurecloud[0].shape[0]}"
                 )
             else:
                 n_blocks = 1

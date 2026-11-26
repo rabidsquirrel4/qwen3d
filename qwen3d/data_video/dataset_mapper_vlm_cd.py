@@ -735,7 +735,13 @@ class VlmCdDatasetMapper:
             raise
 
         changes = self.select_changes(rec["changes"], fr["visibility"], before_ids, after_ids)
+        if self.vc.ONLY_VISIBLE_CHANGES:
+            changes = visible_changes(changes, fr["visibility"], before_ids, after_ids,
+                                              self.vc.MIN_VISIBLE_PIXELS)
+        mode_2d = self.vc.INPUT_MODE == "2d"
+
         prompt = question(self.task, self.vc.STATE_ENCODING, self.vc.ANSWER_FORMAT,
+                          input_mode=self.vc.INPUT_MODE, n_frames=len(before_ids), same_views=before_ids == after_ids,
                           self.vc.ANSWER_ORDER, self.vc.ANSWER_VOLUME, self.vc.ORDER_IN_PROMPT,
                           self.vc.ANSWER_POSE, self.vc.ANSWER_BBOX, single_view=single_view)
         target = answer(self.task, changes, self.vc.ANSWER_ORDER, self.vc.ANSWER_FORMAT,
@@ -743,6 +749,8 @@ class VlmCdDatasetMapper:
 
         native = fr["rgb_before"].shape[1]
         size = int(self.vc.IMAGE_SIZE) if self.vc.IMAGE_SIZE > 0 else native
+        if mode_2d:
+            return self.sample_2d(dataset_dict, fr, before_ids, after_ids, changes, prompt, target, size)
         K = torch.from_numpy(self.intrinsics(rec, size / native))
         shift = np.eye(4, dtype=np.float32)
         shift[0, 3] = self.vc.AFTER_OFFSET
@@ -818,6 +826,32 @@ class VlmCdDatasetMapper:
                 "state_shift": [[0.0, 0.0, 0.0], [float(self.vc.AFTER_OFFSET), 0.0, 0.0]],
             }
 
+        return {
+            **self.common_fields(example_id, before_ids, after_ids, changes, prompt, target, num_views),
+            "images": images,
+            "depths": depths,
+            "poses": poses,
+            "intrinsics": intrinsics,
+            "multi_scale_xyz": multi_scale_xyz,
+            "original_xyz": original_xyz,
+            "new_h": new_h,
+            "new_w": new_w,
+            "height": h,
+            "width": w,
+            "new_image_shape": (h, w),
+            "qwen_pixel_values": pv_list,
+            "qwen_grid_thw": grid_list,
+            "decoder_3d": True,
+            **state_info,
+        }
+
+    def common_fields(self, example_id, before_ids, after_ids, changes, prompt, target, num_views):
+        """Sample fields shared by the 3D and 2D inputs: ids, question / answer, flags.
+
+        Returns
+        -------
+        dict
+        """
         counts = {a: sum(c["action"] == a for c in changes) for a in ACTIONS}
         lang = {
             "text_caption": prompt,
@@ -839,22 +873,9 @@ class VlmCdDatasetMapper:
             "file_names": [f"{example_id}/{s}/{i}" for s in STATES
                            for i in (before_ids if s == "before" else after_ids)],
             "frame_ids": {"before": before_ids, "after": after_ids},
-            "images": images,
-            "depths": depths,
-            "poses": poses,
-            "intrinsics": intrinsics,
-            "multi_scale_xyz": multi_scale_xyz,
-            "original_xyz": original_xyz,
-            "new_h": new_h,
-            "new_w": new_w,
-            "height": h,
-            "width": w,
-            "new_image_shape": (h, w),
-            "qwen_pixel_values": pv_list,
-            "qwen_grid_thw": grid_list,
             "qwen_fcs": None,
             "qwen_feature_paths": None,
-            "decoder_3d": True,
+            # actual_decoder_3d picks the answer from sr3d_data in training, for both inputs.
             "actual_decoder_3d": True,
             "skip_ghost_points": True,
             "full_scene_dataset": True,
@@ -874,4 +895,43 @@ class VlmCdDatasetMapper:
             "pseudo_2d_aug": False,
             **state_info,
             **point_info,
+        }
+
+    def sample_2d(self, dataset_dict, fr, before_ids, after_ids, changes, prompt, target, size):
+        """The 2D-baseline sample (``VLMCD.INPUT_MODE 2d``): the frames as plain images.
+
+        The same RGB frames as the 3D sample, through the same Qwen image processor, but no
+        depth, poses or back-projection: the model gives each frame its own
+        ``<|vision_start|><|image_pad|><|vision_end|>`` block, preceded by its label from
+        ``image_labels`` (before 1..n, then after 1..n), with the standard Qwen2.5-VL M-RoPE.
+
+        Returns
+        -------
+        dict
+        """
+        images = []
+        for state in STATES:
+            for v in range(len(fr[f"rgb_{state}"])):
+                rgb = fr[f"rgb_{state}"][v]
+                if size != rgb.shape[1]:
+                    rgb = np.asarray(Image.fromarray(rgb).resize((size, size), Image.BICUBIC))
+                images.append(torch.as_tensor(np.ascontiguousarray(rgb.transpose(2, 0, 1))))
+        pv_list, grid_list = qwen_preprocess_frames(self._qwen_image_processor, images)
+        h, w = images[0].shape[-2:]
+        merge = 2  # Qwen2.5-VL spatial merge: one token per 2x2 patches
+        labels = [f"{s} {i + 1}: " for s in STATES
+                  for i in range(len(before_ids if s == "before" else after_ids))]
+        return {
+            **self.common_fields(dataset_dict["example_id"], before_ids, after_ids, changes,
+                                 prompt, target, len(images)),
+            "images": images,
+            "new_h": int(grid_list[0][1]) // merge,
+            "new_w": int(grid_list[0][2]) // merge,
+            "height": h,
+            "width": w,
+            "new_image_shape": (h, w),
+            "qwen_pixel_values": pv_list,
+            "qwen_grid_thw": grid_list,
+            "decoder_3d": False,
+            "image_labels": labels,
         }
