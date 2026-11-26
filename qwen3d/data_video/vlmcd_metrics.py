@@ -41,11 +41,15 @@ try:
 except ImportError:  # loaded by file path, with datasets/ on sys.path (score_vlm_cd.py)
     import vlm_cd
 
-DIST_THRESHOLDS = (0.1, 0.25, 0.5)  # metres: move_dist_acc_<t>m and move_dist_precision/recall/f1_<t>m
-ROT_THRESHOLDS = (10, 30, 90)       # degrees: move_rot_acc_<t>deg
-ROT_F1_THRESHOLDS = (10, 20, 30)    # degrees: move_rot_precision/recall/f1_<t>deg
-VOLUME_RATIOS = (1.25, 2.0, 4.0)    # max(pred / true, true / pred)
-VOLUME_FLOOR = 1e-7                 # m^3; keeps logs finite for a 0 prediction
+DIST_THRESHOLDS = (
+    0.1,
+    0.25,
+    0.5,
+)  # metres: move_dist_acc_<t>m and move_dist_precision/recall/f1_<t>m
+ROT_THRESHOLDS = (10, 30, 90)  # degrees: move_rot_acc_<t>deg
+ROT_F1_THRESHOLDS = (10, 20, 30)  # degrees: move_rot_precision/recall/f1_<t>deg
+VOLUME_RATIOS = (1.25, 2.0, 4.0)  # max(pred / true, true / pred)
+VOLUME_FLOOR = 1e-7  # m^3; keeps logs finite for a 0 prediction
 
 
 def match_values(pred, gt, key, actions=None, log=False):
@@ -80,15 +84,26 @@ def match_values(pred, gt, key, actions=None, log=False):
         return math.log10(max(v, VOLUME_FLOOR)) if log else v
 
     pairs, n_gt, n_missing = [], 0, 0
-    groups = {(e["action"], e["category"]) for e in gt
-              if e[key] is not None and (actions is None or e["action"] in actions)}
+    groups = {
+        (e["action"], e["category"])
+        for e in gt
+        if e[key] is not None and (actions is None or e["action"] in actions)
+    }
     for grp in groups:
-        g = [e[key] for e in gt if (e["action"], e["category"]) == grp and e[key] is not None]
+        # g: ground truth distances within group
+        g = [
+            e[key]
+            for e in gt
+            if (e["action"], e["category"]) == grp and e[key] is not None
+        ]
         p_all = [e[key] for e in pred if (e["action"], e["category"]) == grp]
         p = [v for v in p_all if v is not None]
         n_gt += len(g)
         if p:
-            cost = np.abs(np.array([f(v) for v in p])[:, None] - np.array([f(v) for v in g])[None, :])
+            cost = np.abs(
+                np.array([f(v) for v in p])[:, None]
+                - np.array([f(v) for v in g])[None, :]
+            )
             rows, cols = linear_sum_assignment(cost)
             pairs += [(p[r], g[c]) for r, c in zip(rows, cols)]
         n_missing += max(0, min(len(g), len(p_all)) - len(p))
@@ -129,7 +144,11 @@ def order_stats(pred, gt):
     concordant = pairs = 0
     for i in range(len(pred)):
         for j in range(i + 1, len(pred)):
-            if pos[i] is None or pos[j] is None or pred[i]["action"] != pred[j]["action"]:
+            if (
+                pos[i] is None
+                or pos[j] is None
+                or pred[i]["action"] != pred[j]["action"]
+            ):
                 continue
             vi, vj = gt[pos[i]]["volume_m3"], gt[pos[j]]["volume_m3"]
             if vi is not None and vi == vj:
@@ -138,11 +157,19 @@ def order_stats(pred, gt):
             concordant += pos[i] < pos[j]
     self_ok, checked = True, False
     for a, b in zip(pred, pred[1:]):
-        if a["action"] == b["action"] and a["volume_m3"] is not None and b["volume_m3"] is not None:
+        if (
+            a["action"] == b["action"]
+            and a["volume_m3"] is not None
+            and b["volume_m3"] is not None
+        ):
             checked = True
             self_ok &= a["volume_m3"] >= b["volume_m3"]
-    return {"grouped": grouped, "concordant": concordant, "pairs": pairs,
-            "self_ok": self_ok if checked else None}
+    return {
+        "grouped": grouped,
+        "concordant": concordant,
+        "pairs": pairs,
+        "self_ok": self_ok if checked else None,
+    }
 
 
 def _truncated(text):
@@ -193,19 +220,26 @@ def distance_metrics(pairs, n_gt, n_missing, n_pred=0):
     ``n_pred``: predicted moves that give a distance (any class), the precision denominator
     of ``threshold_prf``.
     """
-    out = threshold_prf([abs(p - g) for p, g in pairs], n_pred, n_gt, DIST_THRESHOLDS, "move_dist", "m")
+    out = threshold_prf(
+        [abs(p - g) for p, g in pairs], n_pred, n_gt, DIST_THRESHOLDS, "move_dist", "m"
+    )
     if not n_gt:
         return out
     err = np.array([p - g for p, g in pairs]) if pairs else np.array([np.nan])
     ae = np.abs(err)
-    out.update({
-        "move_dist_mae_m": float(np.mean(ae)),
-        "move_dist_medae_m": float(np.median(ae)),
-        "move_dist_rmse_m": float(np.sqrt(np.mean(err ** 2))),
-        "move_dist_bias_m": float(np.mean(err)),
-        "move_dist_abs_rel": float(np.mean([abs(p - g) / g for p, g in pairs if g > 0]))
-        if any(g > 0 for _, g in pairs) else float("nan"),
-    })
+    out.update(
+        {
+            "move_dist_mae_m": float(np.mean(ae)),
+            "move_dist_medae_m": float(np.median(ae)),
+            "move_dist_rmse_m": float(np.sqrt(np.mean(err**2))),
+            "move_dist_bias_m": float(np.mean(err)),
+            "move_dist_abs_rel": (
+                float(np.mean([abs(p - g) / g for p, g in pairs if g > 0]))
+                if any(g > 0 for _, g in pairs)
+                else float("nan")
+            ),
+        }
+    )
     for t in DIST_THRESHOLDS:
         out[f"move_dist_acc_{t}m"] = float(np.mean(ae <= t)) if pairs else 0.0
     # (move_dist_recall_<t>m from threshold_prf: pairs within t over all true moves with a distance)
@@ -219,11 +253,23 @@ def rotation_metrics(pairs, n_gt, n_missing, n_pred=0):
 
     ``n_pred``: predicted moves that give a ``rotation_deg`` (any class).
     """
-    out = threshold_prf([abs(p - g) for p, g in pairs], n_pred, n_gt, ROT_F1_THRESHOLDS, "move_rot", "deg")
+    out = threshold_prf(
+        [abs(p - g) for p, g in pairs],
+        n_pred,
+        n_gt,
+        ROT_F1_THRESHOLDS,
+        "move_rot",
+        "deg",
+    )
     if not n_gt:
         return out
     ae = np.abs([p - g for p, g in pairs]) if pairs else np.array([np.nan])
-    out.update({"move_rot_mae_deg": float(np.mean(ae)), "move_rot_medae_deg": float(np.median(ae))})
+    out.update(
+        {
+            "move_rot_mae_deg": float(np.mean(ae)),
+            "move_rot_medae_deg": float(np.median(ae)),
+        }
+    )
     for t in ROT_THRESHOLDS:
         out[f"move_rot_acc_{t}deg"] = float(np.mean(ae <= t)) if pairs else 0.0
     out["move_rot_pairs"] = float(len(pairs))
@@ -238,14 +284,21 @@ def pose_metrics(pr, gr):
     by smallest translation error.
     """
     from scipy.optimize import linear_sum_assignment
+
     errs, n_gt, n_missing = [], 0, 0
     for cls in {e["category"] for e in gr if e["action"] == "move" and e["pose"]}:
-        g = [e["pose"] for e in gr if e["action"] == "move" and e["category"] == cls and e["pose"]]
+        g = [
+            e["pose"]
+            for e in gr
+            if e["action"] == "move" and e["category"] == cls and e["pose"]
+        ]
         p_all = [e for e in pr if e["action"] == "move" and e["category"] == cls]
         p = [e["pose"] for e in p_all if e["pose"]]
         n_gt += len(g)
         if p:
-            cost = np.array([[np.linalg.norm(np.subtract(a[:3], b[:3])) for b in g] for a in p])
+            cost = np.array(
+                [[np.linalg.norm(np.subtract(a[:3], b[:3])) for b in g] for a in p]
+            )
             for r, c in zip(*linear_sum_assignment(cost)):
                 dyaw = abs((p[r][3] - g[c][3] + 180.0) % 360.0 - 180.0)
                 errs.append((cost[r, c], dyaw))
@@ -259,8 +312,12 @@ def pose_summary(errs, n_gt, n_missing):
         return {}
     t = np.array([e[0] for e in errs]) if errs else np.array([np.nan])
     y = np.array([e[1] for e in errs]) if errs else np.array([np.nan])
-    out = {"move_pose_trans_mae_m": float(np.mean(t)), "move_pose_trans_medae_m": float(np.median(t)),
-           "move_pose_yaw_mae_deg": float(np.mean(y)), "move_pose_yaw_medae_deg": float(np.median(y))}
+    out = {
+        "move_pose_trans_mae_m": float(np.mean(t)),
+        "move_pose_trans_medae_m": float(np.median(t)),
+        "move_pose_yaw_mae_deg": float(np.mean(y)),
+        "move_pose_yaw_medae_deg": float(np.median(y)),
+    }
     for d in DIST_THRESHOLDS:
         out[f"move_pose_trans_acc_{d}m"] = float(np.mean(t <= d)) if errs else 0.0
     out["move_pose_pairs"] = float(len(errs))
@@ -274,22 +331,30 @@ def bbox_iou(a, b):
     lo = np.maximum(a[:3] - a[3:] / 2, b[:3] - b[3:] / 2)
     hi = np.minimum(a[:3] + a[3:] / 2, b[:3] + b[3:] / 2)
     inter = float(np.prod(np.clip(hi - lo, 0, None)))
-    union = float(np.prod(np.clip(a[3:], 0, None)) + np.prod(np.clip(b[3:], 0, None))) - inter
+    union = (
+        float(np.prod(np.clip(a[3:], 0, None)) + np.prod(np.clip(b[3:], 0, None)))
+        - inter
+    )
     return inter / union if union > 0 else 0.0
 
 
 def bbox_pairs(pr, gr):
     """``(centre errors, IoUs, n_gt, n_missing)`` of predicted vs true boxes, both states."""
     from scipy.optimize import linear_sum_assignment
+
     errs, ious, n_gt, n_missing = [], [], 0, 0
     for state in ("bbox_before", "bbox_after"):
         for grp in {(e["action"], e["category"]) for e in gr if e[state]}:
-            g = [e[state] for e in gr if (e["action"], e["category"]) == grp and e[state]]
+            g = [
+                e[state] for e in gr if (e["action"], e["category"]) == grp and e[state]
+            ]
             p_all = [e for e in pr if (e["action"], e["category"]) == grp]
             p = [e[state] for e in p_all if e[state]]
             n_gt += len(g)
             if p:
-                cost = np.array([[np.linalg.norm(np.subtract(a[:3], b[:3])) for b in g] for a in p])
+                cost = np.array(
+                    [[np.linalg.norm(np.subtract(a[:3], b[:3])) for b in g] for a in p]
+                )
                 for r, c in zip(*linear_sum_assignment(cost)):
                     errs.append(cost[r, c])
                     ious.append(bbox_iou(p[r], g[c]))
@@ -303,10 +368,15 @@ def bbox_summary(errs, ious, n_gt, n_missing):
         return {}
     e = np.array(errs) if errs else np.array([np.nan])
     i = np.array(ious) if ious else np.array([0.0])
-    return {"bbox_center_mae_m": float(np.mean(e)), "bbox_center_medae_m": float(np.median(e)),
-            "bbox_iou_mean": float(np.mean(i)), "bbox_iou_acc_0.25": float(np.mean(i >= 0.25)),
-            "bbox_iou_acc_0.5": float(np.mean(i >= 0.5)),
-            "bbox_pairs": float(len(errs)), "bbox_missing": float(n_missing)}
+    return {
+        "bbox_center_mae_m": float(np.mean(e)),
+        "bbox_center_medae_m": float(np.median(e)),
+        "bbox_iou_mean": float(np.mean(i)),
+        "bbox_iou_acc_0.25": float(np.mean(i >= 0.25)),
+        "bbox_iou_acc_0.5": float(np.mean(i >= 0.5)),
+        "bbox_pairs": float(len(errs)),
+        "bbox_missing": float(n_missing),
+    }
 
 
 def volume_metrics(pairs, n_gt, n_missing):
@@ -314,8 +384,11 @@ def volume_metrics(pairs, n_gt, n_missing):
     if not n_gt:
         return {}
     if not pairs:
-        return {"volume_pairs": 0.0, "volume_missing": float(n_missing),
-                "volume_recall_x2": 0.0}
+        return {
+            "volume_pairs": 0.0,
+            "volume_missing": float(n_missing),
+            "volume_recall_x2": 0.0,
+        }
     p = np.maximum(np.array([x for x, _ in pairs]), VOLUME_FLOOR)
     g = np.maximum(np.array([y for _, y in pairs]), VOLUME_FLOOR)
     le = np.log10(p) - np.log10(g)
@@ -323,7 +396,7 @@ def volume_metrics(pairs, n_gt, n_missing):
     out = {
         "volume_mae_log10": float(np.mean(np.abs(le))),
         "volume_medae_log10": float(np.median(np.abs(le))),
-        "volume_rmse_log10": float(np.sqrt(np.mean(le ** 2))),
+        "volume_rmse_log10": float(np.sqrt(np.mean(le**2))),
         "volume_bias_log10": float(np.mean(le)),
         "volume_abs_rel": float(np.mean(np.abs(p - g) / g)),
         "volume_med_abs_rel": float(np.median(np.abs(p - g) / g)),
@@ -333,6 +406,7 @@ def volume_metrics(pairs, n_gt, n_missing):
     out["volume_recall_x2"] = float(np.sum(ratio <= 2.0)) / n_gt
     if len(pairs) >= 3:
         from scipy.stats import spearmanr
+
         rho = spearmanr(p, g).correlation
         out["volume_spearman"] = float(rho) if rho == rho else float("nan")
     out["volume_pairs"] = float(len(pairs))
@@ -346,14 +420,20 @@ def describe_metrics(res, order="size"):
     tp = fp = fn = 0
     per = {a: [0, 0, 0] for a in vlm_cd.ACTIONS}
     dist, vol, rot = ([], 0, 0), ([], 0, 0), ([], 0, 0)
-    n_pred_dist = n_pred_rot = 0   # predicted moves that give a distance / a rotation_deg
+    n_pred_dist = n_pred_rot = (
+        0  # predicted moves that give a distance / a rotation_deg
+    )
     pose_errs, pose_gt, pose_missing = [], 0, 0
     box_e, box_i, box_gt, box_missing = [], [], 0, 0
     n_json = n_trunc = 0
     json_task = False
-    n_grouped = n_ordered_preds = n_conc = n_pairs = n_exact = n_exact_preds = n_self = n_self_preds = 0
+    n_grouped = n_ordered_preds = n_conc = n_pairs = n_exact = n_exact_preds = (
+        n_self
+    ) = n_self_preds = 0
     for pred, answers in res:
-        pr, gr = vlm_cd.parse_describe_entries(pred), vlm_cd.parse_describe_entries(answers[0])
+        pr, gr = vlm_cd.parse_describe_entries(pred), vlm_cd.parse_describe_entries(
+            answers[0]
+        )
         p = Counter((e["action"], e["category"]) for e in pr)
         g = Counter((e["action"], e["category"]) for e in gr)
         for key in set(p) | set(g):
@@ -368,12 +448,25 @@ def describe_metrics(res, order="size"):
         vol = (vol[0] + v[0], vol[1] + v[1], vol[2] + v[2])
         r = match_values(pr, gr, "rotation_deg", actions=("move",))
         rot = (rot[0] + r[0], rot[1] + r[1], rot[2] + r[2])
-        n_pred_dist += sum(e["action"] == "move" and e["distance_m"] is not None for e in pr)
-        n_pred_rot += sum(e["action"] == "move" and e["rotation_deg"] is not None for e in pr)
+        n_pred_dist += sum(
+            e["action"] == "move" and e["distance_m"] is not None for e in pr
+        )
+        n_pred_rot += sum(
+            e["action"] == "move" and e["rotation_deg"] is not None for e in pr
+        )
         pe, pg, pm = pose_metrics(pr, gr)
-        pose_errs, pose_gt, pose_missing = pose_errs + pe, pose_gt + pg, pose_missing + pm
+        pose_errs, pose_gt, pose_missing = (
+            pose_errs + pe,
+            pose_gt + pg,
+            pose_missing + pm,
+        )
         be, bi, bg, bm = bbox_pairs(pr, gr)
-        box_e, box_i, box_gt, box_missing = box_e + be, box_i + bi, box_gt + bg, box_missing + bm
+        box_e, box_i, box_gt, box_missing = (
+            box_e + be,
+            box_i + bi,
+            box_gt + bg,
+            box_missing + bm,
+        )
         if vlm_cd.is_json_answer(answers[0]):
             json_task = True
             n_json += vlm_cd.is_json_answer(pred)
@@ -392,8 +485,11 @@ def describe_metrics(res, order="size"):
                 n_self += s["self_ok"]
     prec = tp / (tp + fp) if tp + fp else 0.0
     rec = tp / (tp + fn) if tp + fn else 0.0
-    out.update(change_precision=prec, change_recall=rec,
-               change_f1=2 * prec * rec / (prec + rec) if prec + rec else 0.0)
+    out.update(
+        change_precision=prec,
+        change_recall=rec,
+        change_f1=2 * prec * rec / (prec + rec) if prec + rec else 0.0,
+    )
     for a, (t, f_p, f_n) in per.items():
         out[f"{a}_f1"] = 2 * t / (2 * t + f_p + f_n) if t + f_p + f_n else 0.0
     out.update(distance_metrics(*dist, n_pred=n_pred_dist))
@@ -439,8 +535,12 @@ def count_metrics(res):
     out = {f"{a}_count_acc": correct[a] / n for a in acts}
     out.update({f"{a}_count_mae": abs_err[a] / n for a in acts})
     tot = np.array(tot_err, dtype=float) if tot_err else np.zeros(1)
-    out.update(count_all_acc=all_correct / n, total_count_mae=float(np.mean(np.abs(tot))),
-               total_count_bias=float(np.mean(tot)), count_parsed=parsed / n)
+    out.update(
+        count_all_acc=all_correct / n,
+        total_count_mae=float(np.mean(np.abs(tot))),
+        total_count_bias=float(np.mean(tot)),
+        count_parsed=parsed / n,
+    )
     if json_task:
         out["json_valid"] = n_json / n
     return out
