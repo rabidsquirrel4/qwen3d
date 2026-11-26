@@ -143,6 +143,47 @@ def create_ddp_model(
     return ddp
 
 
+class FinalTestHook(hooks.HookBase):
+    """After the last training iteration, evaluate ``VLMCD.FINAL_TEST_SETS`` once.
+
+    Periodic evals (``hooks.EvalHook``) score ``cfg.DATASETS.TEST`` on ``VLMCD.EVAL_SUBSET``
+    val examples. This hook runs after them, only when training reached ``SOLVER.MAX_ITER``
+    (also after a resume that finds training already done), on ``VLMCD.FINAL_EVAL_SUBSET``
+    examples of each final set (0: all, i.e. the 682 test examples per task). The evaluator
+    writes ``inference/<dataset>_predictions.json`` and the copy in the final
+    ``inference/iter_<iteration>/``; metrics are logged with a ``test_full_`` prefix so they do
+    not overwrite the val keys (``val_full_vlmcd...``).
+    """
+
+    def __init__(self, cfg, test_fn):
+        self._cfg = cfg
+        self._test_fn = test_fn
+
+    def after_train(self):
+        if self.trainer.iter + 1 < self.trainer.max_iter:  # stopped early or failed: no final eval
+            return
+        vc = self._cfg.VLMCD
+        cfg = self._cfg.clone()
+        cfg.defrost()
+        cfg.DATASETS.TEST = tuple(vc.FINAL_TEST_SETS)
+        cfg.VLMCD.EVAL_SUBSET = int(vc.FINAL_EVAL_SUBSET)
+        cfg.freeze()
+        logging.getLogger(__name__).info(
+            f"Final evaluation on {cfg.DATASETS.TEST} "
+            f"({cfg.VLMCD.EVAL_SUBSET or 'all'} examples each)")
+        results = self._test_fn(cfg)
+        if comm.is_main_process() and results:
+            from detectron2.evaluation.testing import flatten_results_dict
+            flat = {}
+            for k, v in flatten_results_dict(results).items():
+                try:
+                    flat[k.replace("val_full_", "test_full_", 1)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            self.trainer.storage.put_scalars(**flat, smoothing_hint=False)
+        comm.synchronize()
+
+
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
@@ -573,6 +614,10 @@ class Trainer(DefaultTrainer):
         # Do evaluation after checkpointer, because then if it fails,
         # we can use the saved checkpoint to debug.
         ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD, test_and_save_results))
+        # Then, once training is done, the full final eval (VLMCD.FINAL_TEST_SETS, e.g. all of test).
+        vc = self.cfg.get("VLMCD")
+        if vc is not None and tuple(vc.get("FINAL_TEST_SETS", ()) or ()):
+            ret.append(FinalTestHook(self.cfg, lambda c: self.test(c, self.model)))
 
         if comm.is_main_process():
             # Here the default print/log frequency of each writer is used.

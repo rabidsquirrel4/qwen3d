@@ -519,3 +519,8 @@ def add_maskformer2_video_config(cfg):
     # Periodic evals kept as inference/iter_<iteration>/ during training: the newest this many
     # (0: all). inference/<dataset>_predictions.json always holds the latest eval.
     cfg.VLMCD.KEEP_EVALS = 0
+    # After the last training iteration, evaluate these datasets once (FinalTestHook in train.py),
+    # on FINAL_EVAL_SUBSET examples each (0: all). Empty: no final eval beyond the periodic one.
+    # The launchers set the describe + count test sets (682 examples each).
+    cfg.VLMCD.FINAL_TEST_SETS = ()
+    cfg.VLMCD.FINAL_EVAL_SUBSET = 0
