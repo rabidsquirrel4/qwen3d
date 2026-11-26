@@ -471,7 +471,11 @@ def add_maskformer2_video_config(cfg):
     # "json": describe = JSON array of {action, class, distance_m (moved objects seen in
     # both scans)}, count = {"moved": n, ...}; "text": the earlier "moved the vase ... by 6.4 m; ..."
     cfg.VLMCD.ANSWER_FORMAT = "json"
-    cfg.VLMCD.RETRIES = 5                # Hub read attempts per example
+    # "3d": frames lifted with depth and poses into voxel tokens (Qwen-3D). "2d": the 2D
+    # baseline, the same RGB frames as plain Qwen2.5-VL images (one <|image_pad|> block per
+    # frame, standard M-RoPE), no depth or poses.
+    cfg.VLMCD.INPUT_MODE = "3d"
+    cfg.VLMCD.RETRIES = 5               # Hub read attempts per example
     cfg.VLMCD.CACHE_DIR = ""             # if set, cache eval frames here (deterministic at eval)
     cfg.VLMCD.LOCAL_DIR = ""             # read shards from a local `hf download` copy instead of streaming
     cfg.VLMCD.EVAL_SUBSET = 0            # evaluate on a fixed random subset of this many examples (0: all)
